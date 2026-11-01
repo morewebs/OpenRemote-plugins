@@ -1,0 +1,61 @@
+{
+  "api": 1,
+  "name": "dictation",
+  "displayName": "Dictation",
+  "version": "0.1.0",
+  "description": "Speak into the composer: a microphone button that writes what you say at the cursor, through any OpenAI-compatible transcription service.",
+  "runtime": "js",
+  "entry": "dictation.js",
+  "powers": ["microphone", "network"],
+  "contributes": {
+    "composer_inputs": [{ "id": "dictate", "label": "Dictate", "icon": "microphone" }],
+    "settings": [
+      {
+        "key": "base_url",
+        "type": "string",
+        "label": "Service address",
+        "help": "An OpenAI-compatible endpoint, up to and including its version. OpenAI's is https://api.openai.com/v1; a whisper server on this computer works too.",
+        "default": "https://api.openai.com/v1",
+        "placeholder": "https://api.openai.com/v1"
+      },
+      {
+        "key": "api_key",
+        "type": "secret",
+        "label": "API key",
+        "help": "Sent only to the service address above. Leave it unset for a server that needs none.",
+        "send_to": "base_url"
+      },
+      {
+        "key": "model",
+        "type": "string",
+        "label": "Model",
+        "help": "The service's own name for it. On OpenAI: whisper-1, gpt-4o-mini-transcribe or gpt-4o-transcribe.",
+        "default": "whisper-1"
+      },
+      {
+        "key": "language",
+        "type": "string",
+        "label": "Language",
+        "help": "The language you speak, as a two-letter code like en or de. Empty lets the service tell.",
+        "default": "",
+        "placeholder": "Found by the service"
+      },
+      {
+        "key": "prompt",
+        "type": "string",
+        "label": "Words to expect",
+        "help": "Names and terms to spell your way, like OpenRemote or Tauri.",
+        "default": ""
+      },
+      {
+        "key": "max_minutes",
+        "type": "number",
+        "label": "Longest recording",
+        "help": "Minutes before a recording stops by itself.",
+        "default": 10,
+        "min": 1,
+        "max": 30
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "dictation",
+  "version": "0.1.0",
+  "description": "Speak into OpenRemote's composer: a microphone button that writes what you say at the cursor, through any OpenAI-compatible transcription service.",
+  "author": {
+    "name": "moreweb",
+    "url": "https://moreweb.space"
+  },
+  "homepage": "https://github.com/morewebs/OpenRemote/tree/main/examples/plugins/dictation",
+  "repository": "https://github.com/morewebs/OpenRemote",
+  "license": "AGPL-3.0-only",
+  "keywords": ["dictation", "voice", "speech-to-text", "whisper", "openremote"]
+}
