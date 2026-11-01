@@ -1,0 +1,20 @@
+{
+  "api": 1,
+  "name": "freebuff",
+  "version": "0.1.0",
+  "description": "Freebuff CLI as an OpenRemote harness",
+  "runtime": "process",
+  "powers": ["run_programs", "network"],
+  "harness": {
+    "api": 1,
+    "id": "freebuff",
+    "name": "Freebuff",
+    "driver": {
+      "windows": "bin/windows-x64/freebuff-driver.exe",
+      "default": "bin/freebuff-driver"
+    },
+    "args": [],
+    "models": null,
+    "default_model": null
+  }
+}
