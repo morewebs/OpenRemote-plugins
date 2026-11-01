@@ -56,7 +56,7 @@ impl PtyProc {
         for arg in args {
             builder.arg(arg);
         }
-        builder.env("TERM", "xterm-256color");
+        configure_command_env(&mut builder);
         builder.cwd(cwd);
 
         let child = pair
@@ -168,6 +168,66 @@ impl PtyProc {
     }
 }
 
+/// Check if a local address is listening and accepting TCP connections within the timeout.
+pub fn is_port_listening(addr: &str, timeout: std::time::Duration) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        TcpStream::connect_timeout(&socket_addr, timeout).is_ok()
+    } else {
+        false
+    }
+}
+
+fn var_is_set(key: &str) -> bool {
+    std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
+/// Inherit environment variables from the parent process into `CommandBuilder`,
+/// ensuring proxy variables are propagated and auto-detecting a local proxy if needed.
+pub fn configure_command_env(builder: &mut CommandBuilder) {
+    // 1. Inherit all environment variables from parent process.
+    for (key, val) in std::env::vars() {
+        builder.env(key, val);
+    }
+
+    // 2. Explicitly ensure standard proxy variables (uppercase and lowercase) are passed.
+    const PROXY_VARS: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ];
+    for var in PROXY_VARS {
+        if let Ok(val) = std::env::var(var) {
+            builder.env(var, val);
+        }
+    }
+
+    // 3. If HTTP_PROXY or HTTPS_PROXY is not set, check if 127.0.0.1:10808 is listening or available,
+    // and set HTTP_PROXY and HTTPS_PROXY to http://127.0.0.1:10808.
+    let has_http = var_is_set("HTTP_PROXY") || var_is_set("http_proxy");
+    let has_https = var_is_set("HTTPS_PROXY") || var_is_set("https_proxy");
+
+    if (!has_http || !has_https)
+        && is_port_listening("127.0.0.1:10808", std::time::Duration::from_millis(150))
+    {
+        if !has_http {
+            builder.env("HTTP_PROXY", "http://127.0.0.1:10808");
+            builder.env("http_proxy", "http://127.0.0.1:10808");
+        }
+        if !has_https {
+            builder.env("HTTPS_PROXY", "http://127.0.0.1:10808");
+            builder.env("https_proxy", "http://127.0.0.1:10808");
+        }
+    }
+
+    builder.env("TERM", "xterm-256color");
+}
+
 /// What a terminal answers `ESC[6n` with: cursor at row 1, column 1.
 pub const CURSOR_REPORT: &[u8] = b"\x1b[1;1R";
 
@@ -266,5 +326,15 @@ mod tests {
     fn strip_ansi_survives_a_truncated_escape_sequence() {
         assert_eq!(strip_ansi(b"text\x1b["), "text");
         assert_eq!(strip_ansi(b"text\x1b"), "text");
+    }
+
+    #[test]
+    fn port_listening_detects_open_socket() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        assert!(is_port_listening(&addr, std::time::Duration::from_millis(200)));
+        drop(listener);
     }
 }

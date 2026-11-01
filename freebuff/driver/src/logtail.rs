@@ -24,7 +24,13 @@ pub fn classify_line(line: &str) -> Option<TurnSignal> {
     if line.contains("Main prompt finished") {
         return Some(TurnSignal::Finished);
     }
-    if line.contains("Validation failed") || line.contains("fetch failed") {
+    if line.contains("Validation failed")
+        || line.contains("fetch failed")
+        || line.contains("Freebuff session over; holding queued messages until rejoin")
+        || line.contains("offline")
+        || line.contains("Can't reach Freebuff's servers")
+        || line.contains("Health check failed")
+    {
         return Some(TurnSignal::Failed(redact(&reported_text(line))));
     }
     None
@@ -193,6 +199,42 @@ mod tests {
 
         let fetch = r#"{"level":"ERROR","msg":"fetch failed"}"#;
         assert!(matches!(classify_line(fetch), Some(TurnSignal::Failed(_))));
+    }
+
+    #[test]
+    fn session_over_and_reachability_errors_are_error_turns() {
+        let session_over =
+            r#"{"level":"INFO","msg":"[chat-runtime] Freebuff session over; holding queued messages until rejoin"}"#;
+        match classify_line(session_over) {
+            Some(TurnSignal::Failed(text)) => {
+                assert!(text.contains("Freebuff session over; holding queued messages until rejoin"));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+
+        let offline_line = r#"{"level":"ERROR","msg":"gateway reported offline mode"}"#;
+        match classify_line(offline_line) {
+            Some(TurnSignal::Failed(text)) => {
+                assert!(text.contains("offline"));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+
+        let unreach_line = r#"{"level":"ERROR","msg":"Can't reach Freebuff's servers"}"#;
+        match classify_line(unreach_line) {
+            Some(TurnSignal::Failed(text)) => {
+                assert!(text.contains("Can't reach Freebuff's servers"));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+
+        let health_line = r#"{"level":"DEBUG","msg":"Health check failed, backing off"}"#;
+        match classify_line(health_line) {
+            Some(TurnSignal::Failed(text)) => {
+                assert!(text.contains("Health check failed, backing off"));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
     }
 
     #[test]

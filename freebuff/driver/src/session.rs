@@ -51,13 +51,12 @@ fn activity_note_limit() -> Duration {
         .unwrap_or(NO_ACTIVITY_NOTE)
 }
 
-/// Bracketed paste: the TUI inserts the text, then Enter sends it.
-fn paste_bytes(text: &str) -> Vec<u8> {
+/// Bracketed paste: the TUI inserts the text.
+fn bracketed_paste(text: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(text.len() + 16);
     bytes.extend_from_slice(b"\x1b[200~");
     bytes.extend_from_slice(text.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
-    bytes.push(b'\r');
     bytes
 }
 
@@ -367,7 +366,9 @@ impl Session {
         }
         self.pending_prompt = None;
         if let Some(pty) = self.pty.as_ref() {
-            pty.send(&paste_bytes(&text));
+            pty.send(&bracketed_paste(&text));
+            std::thread::sleep(Duration::from_millis(250));
+            pty.send(b"\r");
         }
         self.prompt_count += 1;
         self.turn_open = true;
@@ -619,6 +620,17 @@ impl Session {
             }
         }
         self.last_activity_note = Some(Instant::now());
+
+        if self.screen.contains("Can't reach Freebuff's servers")
+            || self.screen.contains("Can\u{2019}t reach Freebuff\u{2019}s servers")
+            || self.screen.contains("Try another network")
+        {
+            self.end_turn(Some(
+                "Can't reach Freebuff's servers. Retrying… Try another network.".to_string(),
+            ));
+            return;
+        }
+
         let screen = self.screen_tail();
         if screen.is_empty() {
             self.diag(&format!(
@@ -767,5 +779,26 @@ pub fn run() -> Result<(), String> {
         }
 
         std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bracketed_paste_wraps_in_escape_markers_without_cr() {
+        let bytes = bracketed_paste("hello world");
+        assert_eq!(bytes, b"\x1b[200~hello world\x1b[201~");
+    }
+
+    #[test]
+    fn note_no_activity_detects_offline_screen() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        session.last_progress = Instant::now() - Duration::from_secs(60);
+        session.screen = "Error: Can't reach Freebuff's servers. Try another network".to_string();
+        session.note_no_activity();
+        assert!(!session.turn_open);
     }
 }
