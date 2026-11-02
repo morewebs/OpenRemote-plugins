@@ -13,9 +13,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
+use crate::catalog;
 use crate::chatdir::{self, ChatDir};
 use crate::keys::{self, Key};
 use crate::logtail::{LogTail, TurnSignal};
+use crate::picker;
 use crate::probe;
 use crate::protocol::{parse_command, Command, Events};
 use crate::ptyproc::PtyProc;
@@ -121,7 +123,6 @@ const SETTLE_TICK: Duration = Duration::from_millis(25);
 
 /// What a settle loop should do after looking at the screen and the clock.
 /// Kept as a plain enum so the rule can be tested without a pseudo terminal.
-#[allow(dead_code)] // The catalog capture and the model walk wait on this next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettleOutcome {
     /// The TUI has not printed for the quiet window: its screen is readable.
@@ -135,7 +136,6 @@ pub enum SettleOutcome {
 
 /// The settle rule: quiet wins as soon as the TUI has been silent long enough,
 /// and otherwise the limit is the only way out.
-#[allow(dead_code)] // Called by `settle`, which the model walk uses next.
 pub fn settle_verdicts(
     last_output_elapsed: Duration,
     quiet: Duration,
@@ -148,6 +148,116 @@ pub fn settle_verdicts(
         SettleOutcome::TimedOut
     } else {
         SettleOutcome::Waiting
+    }
+}
+
+/// How long the picker takes to answer one key, and the bound on it. A picker
+/// repaints in one go, so this only has to cover that repaint, not a startup.
+const MODEL_STEP_QUIET: Duration = Duration::from_millis(350);
+const MODEL_STEP_LIMIT: Duration = Duration::from_secs(3);
+/// The most Down presses one walk spends. The picker wraps, so a model away
+/// from the current row is a few presses away; a name Freebuff no longer
+/// offers is refused by the bound instead of pressing for ever.
+const MODEL_MAX_PRESSES: u32 = 240;
+/// How many presses in a row may leave the mark where it was. A list that
+/// stopped moving is a list whose bottom has been reached.
+const MODEL_STANDING_STILL: u32 = 2;
+/// How many interaction frames a failed switch may quote.
+const MODEL_FRAMES: usize = 8;
+
+/// Whether Freebuff has to be pointed at `wanted` before the chat can use it.
+///
+/// `current` is the row the picker marked when it was read. Nothing read yet
+/// means the picker has to be opened: the driver never assumes the chat woke
+/// up on the model the console asked for.
+pub fn needs_switch(current: Option<&str>, wanted: &str) -> bool {
+    match current {
+        Some(current) => current.trim() != wanted.trim(),
+        None => true,
+    }
+}
+
+/// The model `initialized` names: the one the picker showed when it was read,
+/// or the requested name when the driver never got to look at the screen.
+///
+/// The console's chip then shows what the driver actually saw, so a chat that
+/// opened on Freebuff's own model says so instead of echoing the request.
+pub fn reported_model(verified: Option<&str>, requested: &str) -> String {
+    verified.unwrap_or(requested).to_string()
+}
+
+/// What the arrow walk may do after one press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkVerdict {
+    /// The mark is somewhere else: press again.
+    Continue,
+    /// The mark is on the wanted row: select it.
+    Found,
+    /// Stop: the list closed, or the press budget is spent.
+    GiveUp,
+}
+
+pub fn walk_verdict(
+    current: Option<&str>,
+    wanted: &str,
+    presses: u32,
+    picker_open: bool,
+) -> WalkVerdict {
+    // The list closed under the driver. Down belongs to the chat composer
+    // once it has, and this driver does not own that composer.
+    if !picker_open {
+        return WalkVerdict::GiveUp;
+    }
+    if !needs_switch(current, wanted) {
+        return WalkVerdict::Found;
+    }
+    if presses >= MODEL_MAX_PRESSES {
+        return WalkVerdict::GiveUp;
+    }
+    WalkVerdict::Continue
+}
+
+/// What the picker opening may do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenVerdict {
+    /// The screen is the picker: every keystroke below is a picker key.
+    Ready,
+    /// The screen is not the picker and the one retry is unspent.
+    Retry,
+    /// Give up: the retry is spent and the screen is still not the list.
+    GiveUp,
+}
+
+/// Whether `/model` opened the picker, decided from the screen itself.
+///
+/// A startup notice, a survey or an ad can swallow the first `/model`, so the
+/// driver may try once more; after that the screen is not the list and no
+/// further keystroke is sent.
+pub fn opening_verdict(tail: Option<&[String]>, attempts: u32) -> OpenVerdict {
+    match catalog::read_tail(tail) {
+        catalog::ScreenRead::Picker(_) => OpenVerdict::Ready,
+        _ if attempts == 0 => OpenVerdict::Retry,
+        _ => OpenVerdict::GiveUp,
+    }
+}
+
+/// The name of the row the picker marks, when one is visible.
+fn marked_name(picker: &picker::Picker) -> Option<String> {
+    picker
+        .current
+        .and_then(|at| picker.cards.get(at))
+        .map(|card| card.name.clone())
+}
+
+/// The model name a `spawn` asked for.
+///
+/// Freebuff takes a name from its own picker. Anything else in that field (an
+/// object another harness uses, a number) is not a model this chat can start
+/// on, so it counts as no choice at all rather than a guess.
+fn wanted_model(model: Option<&Value>) -> Option<String> {
+    match model? {
+        Value::String(name) if !name.trim().is_empty() => Some(name.trim().to_string()),
+        _ => None,
     }
 }
 
@@ -228,6 +338,14 @@ struct Session {
     screen: crate::screen::Screen,
     /// Stripped text, for diagnostics only: a frame can carry an account string.
     frame_text: String,
+    /// The model switch that failed, if one did: (requested, actual when the
+    /// picker was read). While this is set, no prompt may be typed.
+    model_error: Option<(String, Option<String>)>,
+    /// The model the picker itself showed, which is what `initialized` names.
+    model_verified: Option<String>,
+    /// The last few interaction frames. Quoted in a diagnostic when a switch
+    /// fails, and nowhere else: a frame can carry an account string.
+    frames: crate::screen::FrameLog,
     interrupting: Option<InterruptState>,
     eof_since: Option<Instant>,
     prompt_count: u32,
@@ -265,6 +383,9 @@ impl Session {
             last_confirm_at: None,
             screen: crate::screen::Screen::new(crate::ptyproc::ROWS, crate::ptyproc::COLS),
             frame_text: String::new(),
+            model_error: None,
+            model_verified: None,
+            frames: crate::screen::FrameLog::new(MODEL_FRAMES),
             interrupting: None,
             eof_since: None,
             prompt_count: 0,
@@ -412,6 +533,39 @@ impl Session {
         self.pty = Some(pty);
         self.started_at = Instant::now();
         self.last_output = Instant::now();
+
+        if let Some(raw) = self.model.as_ref() {
+            match wanted_model(Some(raw)) {
+                Some(wanted) => self.choose_starting_model(&wanted),
+                None => self.diag(
+                    "the spawn's model is not a Freebuff model name; this chat starts on the \
+                     model Freebuff already runs",
+                ),
+            }
+        }
+    }
+
+    /// Put the chat on `wanted` before any prompt may be typed.
+    ///
+    /// A switch that fails does not end the session: the chat stays usable,
+    /// `initialized` names the model it really runs, and the prompt is refused
+    /// in a sentence until the person picks again. That refusal is what keeps
+    /// a spend off a model nobody chose.
+    fn choose_starting_model(&mut self, wanted: &str) {
+        self.diag(&format!(
+            "reading Freebuff's model picker to start this chat on {wanted}"
+        ));
+        self.wait_for_first_paint();
+        match self.select_model(wanted) {
+            Ok(()) => {
+                let verified = self
+                    .model_verified
+                    .clone()
+                    .unwrap_or_else(|| wanted.to_string());
+                self.diag(&format!("Freebuff runs {verified}"));
+            }
+            Err(reason) => self.diag(&format!("model: {reason}")),
+        }
     }
 
     fn prompt(&mut self, text: String) {
@@ -431,7 +585,37 @@ impl Session {
             self.diag("a prompt is already waiting for the TUI to settle; ignored");
             return;
         }
+        // Sending here would spend on a model the user did not choose, and
+        // dropping the prompt silently would leave the console waiting on a
+        // turn that never starts. A reported refusal is the honest third path.
+        if let Some(block) = self.prompt_block() {
+            self.diag(&block);
+            let _ = self
+                .events
+                .turn_completed("error", "failed", true, Some(&block));
+            return;
+        }
         self.pending_prompt = Some(text);
+    }
+
+    /// The sentence a prompt is refused with when the chat could not be put on
+    /// the model the console picked.
+    ///
+    /// `None` means the prompt may be typed. `Some` names the requested model
+    /// by its own words and, when the picker was read, the model the chat runs
+    /// instead, so a person can decide without opening the picker themselves.
+    pub fn prompt_block(&self) -> Option<String> {
+        let (requested, actual) = self.model_error.as_ref()?;
+        Some(match actual {
+            Some(actual) => format!(
+                "Freebuff did not switch to {requested}: it is still on {actual}, \
+                 so the prompt was not sent. Pick another model, then send it again."
+            ),
+            None => format!(
+                "Freebuff did not switch to {requested}, so the prompt was not sent. \
+                 Pick another model, then send it again."
+            ),
+        })
     }
 
     fn interrupt(&mut self) {
@@ -530,7 +714,6 @@ impl Session {
     /// The clock is the TUI's own last output, so a screen that was already
     /// quiet settles at once. A caller that has just pressed a key and needs
     /// the repaint before reading should wait for output another way.
-    #[allow(dead_code)] // The catalog capture and the model walk wait on this.
     pub fn settle(&mut self, quiet: Duration, limit: Duration) -> bool {
         let started = Instant::now();
         loop {
@@ -540,6 +723,273 @@ impl Session {
                 SettleOutcome::TimedOut => return false,
                 SettleOutcome::Waiting => std::thread::sleep(SETTLE_TICK),
             }
+        }
+    }
+
+    /// Pump until the TUI prints something newer than `before`, or the bound
+    /// is up.
+    fn wait_for_fresh_output(&mut self, before: Instant) -> bool {
+        let started = Instant::now();
+        loop {
+            self.pump_pty();
+            if self.last_output > before {
+                return true;
+            }
+            // A CLI that closed its output will never repaint, so there is
+            // nothing to wait for and nothing a keystroke could reach.
+            if self.pty.as_ref().map(PtyProc::eof).unwrap_or(true) {
+                return false;
+            }
+            if started.elapsed() >= MODEL_STEP_LIMIT {
+                return false;
+            }
+            std::thread::sleep(SETTLE_TICK);
+        }
+    }
+
+    /// Press one key and read the screen Freebuff drew in answer to it.
+    ///
+    /// `settle` on its own is not enough after a key: its clock counts from
+    /// the TUI's last output, which at the moment of the press is the screen
+    /// *before* the keystroke, so it can return before the repaint and the
+    /// parse that follows would read the pre-key screen. Waiting for fresh
+    /// output first is what makes the screen after a key the screen a person
+    /// would see. Every key the model walk sends passes through here, and
+    /// every one leaves a frame a failed switch can be diagnosed from.
+    fn press_and_settle(&mut self, label: &str, key: Key) {
+        let before = self.last_output;
+        if let Some(pty) = self.pty.as_ref() {
+            pty.send(&keys::bytes(key));
+        }
+        // Both waits ignore their own answer on purpose: the parse that
+        // follows decides what the screen is, and a timed-out wait means
+        // "read it and see", never "assume it is ready".
+        let _ = self.wait_for_fresh_output(before);
+        let _ = self.settle(MODEL_STEP_QUIET, MODEL_STEP_LIMIT);
+        let tail = self.screen_tail();
+        self.frames.push(label, tail);
+    }
+
+    /// The rows a person can see, or nothing when the grid could not follow
+    /// the last repaint.
+    fn screen_rows(&self) -> Option<Vec<String>> {
+        let (rows, _cols) = self.screen.size();
+        self.screen.tail(rows as usize)
+    }
+
+    /// The picker as the screen shows it, if it shows one.
+    fn read_picker(&self) -> Option<picker::Picker> {
+        picker::parse(self.screen_rows()?.as_slice())
+    }
+
+    /// Wait for the startup paint and the quiet after it before typing.
+    ///
+    /// The session's settle rule, with one addition: a screen has to have
+    /// painted at least once. The quiet clock starts at spawn, so a TUI that
+    /// has drawn nothing is not quiet, it has not started, and typing into it
+    /// is how a key ends up in Freebuff's startup output.
+    fn wait_for_first_paint(&mut self) {
+        let started = Instant::now();
+        loop {
+            self.pump_pty();
+            match settle_verdicts(
+                self.last_output.elapsed(),
+                SETTLE_QUIET,
+                started.elapsed(),
+                SETTLE_LIMIT,
+            ) {
+                SettleOutcome::Quiet if self.seen_output => return,
+                SettleOutcome::TimedOut => return,
+                SettleOutcome::Quiet | SettleOutcome::Waiting => {
+                    std::thread::sleep(SETTLE_TICK);
+                }
+            }
+        }
+    }
+
+    /// Open the model picker and return what it shows.
+    ///
+    /// A startup notice, a survey or an ad can swallow the first `/model`, so
+    /// the attempt is made twice. The retry closes whatever is on screen and
+    /// only types again on a screen known to be readable and known not to be
+    /// the picker: Enter on an open list would select the highlighted row,
+    /// which is the one keystroke here that could change the user's model.
+    fn open_model_picker(&mut self) -> Result<picker::Picker, String> {
+        for attempt in 0..2 {
+            if attempt > 0 {
+                self.press_and_settle("model: escape", Key::Escape);
+                catalog::typing_is_safe(&self.screen)?;
+            }
+            self.press_and_settle("model: /model", Key::Text("/model".to_string()));
+            self.press_and_settle("model: enter", Key::Enter);
+            let tail = self.screen_rows();
+            match opening_verdict(tail.as_deref(), attempt) {
+                OpenVerdict::Ready => {
+                    if let Some(picker) = tail.as_deref().and_then(picker::parse) {
+                        self.diag(&format!(
+                            "the model picker is open with {} card(s)",
+                            picker.cards.len()
+                        ));
+                        return Ok(picker);
+                    }
+                    return Err("Freebuff's model picker could not be read".to_string());
+                }
+                OpenVerdict::Retry => continue,
+                OpenVerdict::GiveUp => {
+                    return Err("Freebuff did not open its model picker".to_string());
+                }
+            }
+        }
+        Err("Freebuff did not open its model picker".to_string())
+    }
+
+    /// Put this chat on `wanted`, and prove it with the screen.
+    ///
+    /// Nothing here types a prompt or answers a spend dialog: the keys are
+    /// `/model`, Enter, Down and Escape. A switch that cannot be verified is
+    /// an error, so the caller refuses the prompt instead of spending on a
+    /// model the user did not choose.
+    pub fn select_model(&mut self, wanted: &str) -> Result<(), String> {
+        let wanted = wanted.trim().to_string();
+        if self.pty.is_none() {
+            return Err(self.refuse_switch(&wanted, None, "Freebuff is not running".to_string()));
+        }
+        // A new attempt supersedes the last refusal: only a switch that fails
+        // again keeps the prompt blocked, so a chat that was put right is not
+        // stuck behind a stale sentence.
+        self.model_error = None;
+
+        // 1. Read the row the picker marks: that is the model the chat runs
+        // now, and the only reading taken before an arrow is pressed.
+        let first = match self.open_model_picker() {
+            Ok(picker) => picker,
+            Err(reason) => return Err(self.refuse_switch(&wanted, None, reason)),
+        };
+        let mut marked = marked_name(&first);
+        self.model_verified = marked.clone();
+
+        // 2. Freebuff already runs it: close the list, press no arrow, and take
+        // the catalog refresh this screen hands over for free.
+        if !needs_switch(marked.as_deref(), &wanted) {
+            self.press_and_settle("model: escape", Key::Escape);
+            catalog::write_models(&first);
+            return Ok(());
+        }
+        self.diag(&format!(
+            "Freebuff runs {}, so the picker is walked to {wanted}",
+            marked
+                .as_deref()
+                .unwrap_or("a model the screen does not name")
+        ));
+
+        // 3. Walk the list. The picker wraps, so Down reaches every row from
+        // the current one, and typing is never used to filter it.
+        let mut presses = 0u32;
+        let mut standing = 0u32;
+        loop {
+            self.press_and_settle(&format!("model: down {presses}"), Key::Down);
+            presses += 1;
+            let next = self.read_picker();
+            let next_marked = next.as_ref().and_then(marked_name);
+            let verdict = walk_verdict(next_marked.as_deref(), &wanted, presses, next.is_some());
+            if verdict == WalkVerdict::Found {
+                marked = next_marked;
+                break;
+            }
+            if verdict == WalkVerdict::GiveUp {
+                return Err(self.refuse_switch(
+                    &wanted,
+                    marked.clone(),
+                    format!("Freebuff does not offer a model called {wanted}"),
+                ));
+            }
+            if next_marked == marked {
+                standing += 1;
+                if standing >= MODEL_STANDING_STILL {
+                    // Down is not moving the mark any more, so the list is at
+                    // its bottom and the wanted name was not in it.
+                    return Err(self.refuse_switch(
+                        &wanted,
+                        marked.clone(),
+                        format!("Freebuff does not offer a model called {wanted}"),
+                    ));
+                }
+            } else {
+                standing = 0;
+                marked = next_marked;
+            }
+        }
+        self.diag(&format!(
+            "the picker marks {wanted} after {presses} press(es); selecting it"
+        ));
+
+        // 4. Enter selects the highlighted row. A list still on screen means
+        // the key did not take, and Escape closes it before another key.
+        self.press_and_settle("model: enter", Key::Enter);
+        if self.read_picker().is_some() {
+            self.press_and_settle("model: escape", Key::Escape);
+            return Err(self.refuse_switch(
+                &wanted,
+                marked.clone(),
+                "Freebuff did not close its picker".to_string(),
+            ));
+        }
+
+        // 5. Verify the only way this screen allows: open the picker again and
+        // read which row it marks. Nothing else proves the switch was taken.
+        let reopened = match self.open_model_picker() {
+            Ok(picker) => picker,
+            Err(reason) => return Err(self.refuse_switch(&wanted, marked.clone(), reason)),
+        };
+        let verified = marked_name(&reopened);
+        self.press_and_settle("model: escape", Key::Escape);
+        if verified.as_deref().map(str::trim) != Some(wanted.as_str()) {
+            let actual = verified.clone().or_else(|| marked.clone());
+            return Err(self.refuse_switch(
+                &wanted,
+                actual.clone(),
+                format!(
+                    "Freebuff kept {} after the switch to {wanted}",
+                    actual.as_deref().unwrap_or("its own model")
+                ),
+            ));
+        }
+        self.model_verified = verified;
+        // The screen that proved the switch is also a catalog read.
+        catalog::write_models(&reopened);
+        Ok(())
+    }
+
+    /// Record a failed switch and hand the caller its sentence.
+    ///
+    /// The last frame is quoted on stderr only: it is the one thing that says
+    /// what the screen looked like when the walk gave up, and a frame can
+    /// carry the signed-in address or a balance, so it never becomes an event
+    /// field a synced chat would keep.
+    fn refuse_switch(&mut self, wanted: &str, actual: Option<String>, reason: String) -> String {
+        self.model_error = Some((wanted.trim().to_string(), actual));
+        let last = self
+            .frames
+            .last()
+            .map(|(label, tail)| (label.to_string(), tail.to_string()));
+        if let Some((label, tail)) = last {
+            self.diag(&format!("model: after {label} the screen showed: {tail}"));
+        }
+        reason
+    }
+
+    /// The model `initialized` names.
+    ///
+    /// With a requested model, the name is the one the driver proved, or the
+    /// requested name when the picker was never read. With no request at all
+    /// the driver has nothing to add, so the daemon's own value stands.
+    fn reported(&self) -> Option<Value> {
+        match wanted_model(self.model.as_ref()) {
+            Some(requested) => Some(Value::String(reported_model(
+                self.model_verified.as_deref(),
+                &requested,
+            ))),
+            None => self.model.clone(),
         }
     }
 
@@ -592,7 +1042,8 @@ impl Session {
         if !self.initialized {
             self.initialized = true;
             let session_ref = chat.id.clone();
-            let model = self.model.clone();
+            // The chip shows the model the driver saw, never the request.
+            let model = self.reported();
             let permission_mode = self.permission_mode.clone();
             let _ = self
                 .events
@@ -1228,5 +1679,71 @@ mod tests {
             ),
             Waiting
         );
+    }
+
+    #[test]
+    fn no_arrow_is_sent_when_freebuff_already_runs_the_wanted_model() {
+        assert!(!needs_switch(
+            Some("DeepSeek V4.1 Flash 10/17 • high"),
+            "DeepSeek V4.1 Flash 10/17 • high"
+        ));
+        assert!(needs_switch(
+            Some("DeepSeek V4.1 Flash Slow • high"),
+            "DeepSeek V4.1 Flash 10/17 • high"
+        ));
+        // Nothing read yet: read the picker, never assume.
+        assert!(needs_switch(None, "DeepSeek V4.1 Flash 10/17 • high"));
+    }
+
+    #[test]
+    fn a_prompt_after_a_failed_switch_is_refused_not_sent() {
+        let mut session = Session::new();
+        session.model_error = Some(("X".into(), Some("Y".into())));
+        let block = session.prompt_block().expect("a refusal");
+        assert!(block.contains("did not switch to X"));
+        assert!(block.contains("still on Y"));
+        assert!(block.contains("not sent"));
+    }
+
+    #[test]
+    fn an_unreadable_picker_refuses_rather_than_guesses() {
+        let mut session = Session::new();
+        session.model_error = Some(("X".into(), None));
+        assert!(session
+            .prompt_block()
+            .unwrap()
+            .contains("did not switch to X"));
+    }
+
+    #[test]
+    fn the_walk_gives_up_instead_of_pressing_for_ever() {
+        use WalkVerdict::*;
+        assert_eq!(walk_verdict(Some("A"), "B", 0, true), Continue);
+        assert_eq!(walk_verdict(Some("B"), "B", 7, true), Found);
+        assert_eq!(walk_verdict(Some("A"), "B", 240, true), GiveUp);
+        // The picker closed under us: no more presses, the screen is not the picker.
+        assert_eq!(walk_verdict(Some("A"), "B", 3, false), GiveUp);
+    }
+
+    #[test]
+    fn a_survey_between_keys_gets_one_retry_and_never_a_typed_prompt() {
+        use OpenVerdict::*;
+        let survey: Vec<String> = [
+            "How did you hear about Freebuff?",
+            "1. A friend",
+            "2. Search",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(opening_verdict(Some(&survey), 0), Retry);
+        assert_eq!(opening_verdict(Some(&survey), 1), GiveUp);
+        assert_eq!(opening_verdict(None, 0), Retry);
+    }
+
+    #[test]
+    fn initialized_reports_the_verified_model_not_the_requested_one() {
+        assert_eq!(reported_model(Some("Y"), "X"), "Y");
+        assert_eq!(reported_model(None, "X"), "X");
     }
 }

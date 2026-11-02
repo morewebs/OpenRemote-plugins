@@ -64,7 +64,7 @@ const STANDING_STILL: u32 = 2;
 /// field names, so `models.json` parses as the daemon's own catalog. The
 /// daemon's `resolved_model` and `reasoning_efforts` are left out because
 /// Freebuff has neither, and every one of those fields defaults to empty.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelDescriptor {
     /// The name the picker prints, and therefore the name a `spawn` may ask
     /// for: the walk matches this string exactly.
@@ -83,7 +83,7 @@ pub struct ModelDescriptor {
 
 /// What `--catalog` prints and writes: the picker's cards, and when they were
 /// read. The stamp is what makes a stale list visible instead of silent.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Catalog {
     /// Milliseconds since the Unix epoch, as the daemon stores it.
     pub captured_at: u64,
@@ -149,7 +149,7 @@ fn is_a_price(name: &str) -> bool {
 /// The three answers are kept apart because `None` from a two-state question
 /// would merge "readable, and not the picker" with "I could not read it", and
 /// the second one must never be followed by a keystroke.
-enum ScreenRead {
+pub(crate) enum ScreenRead {
     /// The picker, read.
     Picker(picker::Picker),
     /// A readable screen that is not the picker: typing a command is safe.
@@ -173,10 +173,19 @@ pub fn capture_is_a_picker(screen: &Screen) -> Option<picker::Picker> {
 /// What the screen shows: the picker, another screen, or nothing readable.
 fn read_screen(screen: &Screen) -> ScreenRead {
     let (rows, _cols) = screen.size();
-    let Some(tail) = screen.tail(rows as usize) else {
+    read_tail(screen.tail(rows as usize).as_deref())
+}
+
+/// What a tail of rows shows: the picker, another screen, or nothing readable.
+///
+/// The one place the question is answered from rows alone, so the session's
+/// picker walk and the catalog's own capture cannot disagree about what a
+/// picker is.
+pub(crate) fn read_tail(tail: Option<&[String]>) -> ScreenRead {
+    let Some(rows) = tail else {
         return ScreenRead::Unreadable;
     };
-    match picker::parse(&tail) {
+    match picker::parse(rows) {
         Some(picker) => ScreenRead::Picker(picker),
         None => ScreenRead::NotAPicker,
     }
@@ -393,6 +402,70 @@ fn step_from(read: &ScreenRead) -> Step {
             "Freebuff's screen could not be read, so nothing was typed again: \
              the model the chat remembers is unchanged",
         ),
+    }
+}
+
+/// Whether `/model` may be typed on the screen that is showing.
+///
+/// Enter on an open picker selects the highlighted row, so the one keystroke
+/// that can change the user's model is only sent on a screen known to be
+/// readable and known not to be the picker. The sentence on the error side is
+/// why the decision was made, not what went wrong.
+pub(crate) fn typing_is_safe(screen: &Screen) -> Result<(), String> {
+    match step_from(&read_screen(screen)) {
+        Step::Type => Ok(()),
+        Step::Stop(reason) => Err(reason.to_string()),
+    }
+}
+
+/// Write `models.json` from a picker that is on the screen right now.
+///
+/// A chat that opened the picker for a model choice already has a reading in
+/// hand, so the file is refreshed without a second capture. That reading is
+/// only what the window showed, though: the picker scrolls, and a chat screen
+/// has room for a handful of cards. The file is therefore updated rather than
+/// replaced, so a model that scrolled out of view is not lost from the
+/// console's list; only `--catalog`, which walks the whole list, rewrites the
+/// file outright. Best effort by design: the daemon falls back to the
+/// manifest's model list when the file is missing, and a cache write must
+/// never fail a chat.
+pub fn write_models(picker: &picker::Picker) {
+    let fresh = Catalog::from_picker(picker, now_millis());
+    let merged = fold_into_previous(fresh, read_previous());
+    let _ = std::fs::write(MODELS_FILE, merged.to_line());
+}
+
+/// The catalog already on disk, when there is a readable one.
+fn read_previous() -> Option<Catalog> {
+    let text = std::fs::read_to_string(MODELS_FILE).ok()?;
+    serde_json::from_str::<Catalog>(&text).ok()
+}
+
+/// Fold a window's reading into the catalog already on disk.
+fn fold_into_previous(fresh: Catalog, previous: Option<Catalog>) -> Catalog {
+    let Some(previous) = previous else {
+        return fresh;
+    };
+    if fresh.models.is_empty() {
+        // An empty reading is not evidence that Freebuff dropped every model.
+        return previous;
+    }
+    let mut models = fresh.models;
+    for old in previous.models {
+        if !models.iter().any(|model| model.model == old.model) {
+            models.push(old);
+        }
+    }
+    // The row the picker marks is the only model that may carry the default
+    // flag; a reading that saw no mark leaves the previous default standing.
+    let default = fresh.default.or(previous.default);
+    for model in models.iter_mut() {
+        model.is_default = default.as_deref() == Some(model.model.as_str());
+    }
+    Catalog {
+        captured_at: fresh.captured_at,
+        default,
+        models,
     }
 }
 
@@ -785,5 +858,82 @@ mod tests {
         assert_eq!(value["models"].as_array().unwrap().len(), 0);
         assert!(value["default"].is_null());
         assert_eq!(value["reason"], "Freebuff did not open its model picker");
+    }
+
+    #[test]
+    fn a_window_read_keeps_the_models_that_scrolled_out_of_view() {
+        // The chat screen holds a handful of cards, so the reading a spawn
+        // takes is a window on the list, not the list. Replacing the file with
+        // it would quietly drop every model below the fold from the console.
+        let picker = capture_is_a_picker(&boxed_screen()).expect("a picker");
+        let fresh = Catalog::from_picker(&picker, 1_762_000_000_000);
+        let unseen = "A model below the fold";
+        let previous = Catalog {
+            captured_at: 1_761_000_000_000,
+            default: Some(unseen.to_string()),
+            models: vec![
+                ModelDescriptor {
+                    model: unseen.to_string(),
+                    display_name: None,
+                    detail: Some("2x".to_string()),
+                    note: None,
+                    is_default: true,
+                },
+                ModelDescriptor {
+                    model: picker.cards[0].name.clone(),
+                    display_name: None,
+                    detail: Some("an older reading".to_string()),
+                    note: None,
+                    is_default: false,
+                },
+            ],
+        };
+        let merged = fold_into_previous(fresh.clone(), Some(previous));
+
+        assert_eq!(
+            merged.models.len(),
+            fresh.models.len() + 1,
+            "the model out of view survives the update"
+        );
+        assert!(merged.models.iter().any(|model| model.model == unseen));
+        assert_ne!(
+            merged.models[0].detail,
+            Some("an older reading".to_string()),
+            "a model the window showed carries the fresh reading"
+        );
+        let default = fresh.default.clone().expect("a marked model");
+        assert_eq!(merged.default.as_deref(), Some(default.as_str()));
+        let marked: Vec<&str> = merged
+            .models
+            .iter()
+            .filter(|model| model.is_default)
+            .map(|model| model.model.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec![default.as_str()],
+            "one model carries the default flag, and it is the marked one"
+        );
+    }
+
+    #[test]
+    fn an_empty_reading_does_not_empty_the_catalog_on_disk() {
+        let picker = capture_is_a_picker(&boxed_screen()).expect("a picker");
+        let fresh = Catalog::from_picker(&picker, 1_762_000_000_000);
+        let empty = Catalog {
+            captured_at: 1_762_000_000_001,
+            default: None,
+            models: Vec::new(),
+        };
+        assert_eq!(
+            fold_into_previous(empty, Some(fresh.clone())),
+            fresh,
+            "a screen with no readable card is not a catalog of no models"
+        );
+        assert_eq!(
+            fold_into_previous(fresh.clone(), None),
+            fresh,
+            "the first write is the reading itself"
+        );
     }
 }

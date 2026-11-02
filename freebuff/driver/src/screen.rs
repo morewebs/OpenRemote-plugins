@@ -384,13 +384,11 @@ fn ignorable_mode(body: &str) -> bool {
 /// be reported with the screen it broke on. Quoted on stderr only: a frame can
 /// carry balance text or an account address, and nothing here leaves the
 /// machine.
-#[allow(dead_code)] // Wired into the picker reader; the frames it keeps are the point.
 pub struct FrameLog {
     entries: Vec<(String, String)>,
     capacity: usize,
 }
 
-#[allow(dead_code)]
 impl FrameLog {
     pub fn new(capacity: usize) -> Self {
         Self {

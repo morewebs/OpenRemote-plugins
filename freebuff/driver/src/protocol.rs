@@ -144,6 +144,17 @@ impl Events {
         self.emit(serde_json::json!({ "type": "text", "text": text }))
     }
 
+    /// The model a running chat now runs.
+    ///
+    /// A spawn reports the model it started on through `initialized`; this is
+    /// the event for a model change inside a running chat, which the daemon
+    /// folds into the session so the console's chip follows what the driver
+    /// verified rather than what was asked for.
+    #[allow(dead_code)] // The live settings path emits this next.
+    pub fn model_reported(&mut self, model: &str) -> bool {
+        self.emit(serde_json::json!({ "type": "model_reported", "model": model }))
+    }
+
     pub fn text_delta(&mut self, text: &str) -> bool {
         self.emit(serde_json::json!({ "type": "text_delta", "text": text }))
     }
