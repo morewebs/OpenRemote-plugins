@@ -42,6 +42,11 @@ pub struct Picker {
 const CURRENT_MARKER: char = '›';
 /// A marker the picker puts on a row that is not the current model.
 const OTHER_MARKER: char = '×';
+/// The footer the picker prints above its list. It is the only stable boundary
+/// between the chat's own rows and the picker, and it is Freebuff's own
+/// wording, so a rename in the CLI makes the parse fail loudly instead of
+/// reading the balance for a model.
+const PICKER_FOOTER: &str = "↑↓ choose model";
 
 impl Picker {
     /// The index of the card named exactly `name`, or nothing.
@@ -71,6 +76,39 @@ pub fn parse(tail: &[String]) -> Option<Picker> {
         return None;
     }
 
+    // The picker prints its own footer above the list. Everything above that
+    // row belongs to the chat: the banner, the rotating tip box, the balance.
+    // Reading only what follows it is what keeps those rows out of a catalog.
+    let start = rows
+        .iter()
+        .rposition(|row| row.contains(PICKER_FOOTER))
+        .map(|at| at + 1)
+        .unwrap_or(0);
+    let region = &rows[start..];
+
+    // Two layouts, one parser. Freebuff 0.2.35 draws each model inside a box
+    // at both widths measured so far; the design capture of the same screen is
+    // the bare-line layout, which is kept because a narrow frame can still be
+    // that shape and the saved fixture is written in it.
+    let mut picker = if region.iter().any(|row| box_content(row).is_some()) {
+        parse_boxed(region)
+    } else {
+        parse_legacy(region)
+    };
+    picker.current = picker.cards.iter().position(|card| card.current);
+
+    // One card alone is not a picker. Two distinct names is the structural
+    // check that keeps a transcript line with a separator from being walked.
+    // Cards are deduplicated by name in both modes.
+    if picker.cards.len() < 2 {
+        return None;
+    }
+    Some(picker)
+}
+
+/// The bare-line layout: every rule below was written against the design's
+/// capture, before the live screen was measured.
+fn parse_legacy(rows: &[&str]) -> Picker {
     let detail: Vec<bool> = rows.iter().map(|row| is_detail(row)).collect();
     let marked: Vec<bool> = rows.iter().map(|row| marker(row).is_some()).collect();
 
@@ -157,15 +195,135 @@ pub fn parse(tail: &[String]) -> Option<Picker> {
         }
     }
     picker.section = section;
-    picker.current = picker.cards.iter().position(|card| card.current);
+    picker
+}
 
-    // One card alone is not a picker. Two distinct names is the structural
-    // check that keeps a transcript line with a separator from being walked.
-    // Cards are deduplicated by name above, so this is a distinct count.
-    if picker.cards.len() < 2 {
-        return None;
+/// The boxed layout: one border, one name row and at most one body row per
+/// model. A box that the status line clipped has no closing border, and the
+/// next opening border ends it just the same.
+fn parse_boxed(rows: &[&str]) -> Picker {
+    let mut picker = Picker {
+        cards: Vec::new(),
+        current: None,
+        section: None,
+    };
+    let mut section: Option<String> = None;
+    let mut in_box = false;
+    let mut name_seen = false;
+    let mut body_seen = false;
+    let mut card_at: Option<usize> = None;
+
+    for row in rows {
+        if is_box_border(row) {
+            if row.contains('┌') {
+                in_box = true;
+                name_seen = false;
+                body_seen = false;
+                card_at = None;
+            } else if row.contains('└') {
+                in_box = false;
+                card_at = None;
+            }
+            continue;
+        }
+        match box_content(row) {
+            Some(content) => {
+                if !in_box || content.is_empty() {
+                    continue;
+                }
+                if !name_seen {
+                    name_seen = true;
+                    // A box is a model card when its first line names one:
+                    // every model name is followed by the picker's separator.
+                    // A tip box has no separator, which is what keeps it out
+                    // of the catalog.
+                    if !content.contains(" · ") {
+                        continue;
+                    }
+                    let name = card_name(content);
+                    let at = match picker.cards.iter().position(|card| card.name == name) {
+                        Some(existing) => existing,
+                        None => {
+                            picker.cards.push(Card {
+                                name,
+                                tagline: tagline(content),
+                                detail: None,
+                                note: None,
+                                section: section.clone(),
+                                current: false,
+                            });
+                            picker.cards.len() - 1
+                        }
+                    };
+                    if marker(content) == Some(CURRENT_MARKER) {
+                        picker.cards[at].current = true;
+                    }
+                    card_at = Some(at);
+                    continue;
+                }
+                if !body_seen {
+                    body_seen = true;
+                    let Some(at) = card_at else {
+                        continue;
+                    };
+                    // One body line per card: the cost line when the CLI
+                    // prints one, the notice otherwise. The rows after it are
+                    // the picker's own adverts and never become the hover
+                    // title or the cost detail.
+                    let text = content.to_string();
+                    if is_detail(&text) {
+                        picker.cards[at].detail = Some(text);
+                    } else {
+                        picker.cards[at].note = Some(text);
+                    }
+                }
+            }
+            None => {
+                if in_box {
+                    continue;
+                }
+                // A bare row inside the picker's region is a section label:
+                // PREMIUM carries the cost range, OPTIMIZED and POWERFUL carry
+                // their description.
+                if is_label_row(row) {
+                    section = Some(first_segment(row).to_string());
+                }
+            }
+        }
     }
-    Some(picker)
+    picker.section = section;
+    picker
+}
+
+/// Whether a row is a box border, with or without a scrollbar cell after it.
+fn is_box_border(row: &str) -> bool {
+    let trimmed = row.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().all(|ch| {
+            matches!(
+                ch,
+                '┌' | '─'
+                    | '┐'
+                    | '├'
+                    | '┤'
+                    | '└'
+                    | '┘'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '▄'
+                    | '▀'
+                    | '█'
+            )
+        })
+}
+
+/// The text inside a box row, when the row is one.
+fn box_content(row: &str) -> Option<&str> {
+    let trimmed = row.trim();
+    let inner = trimmed.strip_prefix('│')?;
+    let inner = inner.strip_suffix('│')?;
+    Some(inner.trim())
 }
 
 /// The first `·`-separated segment of a row, trimmed. The middle dot is the
@@ -362,5 +520,132 @@ mod tests {
         assert_eq!(picker.find("DeepSeek V4.1 Flash 10/17 • high"), Some(3));
         assert_eq!(picker.find("deepseek v4.1 flash 10/17 • high"), None);
         assert_eq!(picker.find("DeepSeek V4.1 Flash"), None);
+    }
+
+    /// The real picker at 80x45, the width whose layout the design capture
+    /// shows. Saved from a live window, card rows only.
+    const PICKER_80: &str = include_str!("../../spike/screens/picker-0.2.35.txt");
+    /// The real picker at the driver's own 140x45.
+    const PICKER_140: &str = include_str!("../../spike/screens/picker-0.2.35-140x45.txt");
+
+    fn rows_of(capture: &str) -> Vec<String> {
+        capture.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_eighty_column_capture_reads_six_cards_with_deepseek_marked() {
+        let picker = parse(&rows_of(PICKER_80)).expect("a picker");
+        let names: Vec<&str> = picker.cards.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Glyph Cluster • high",
+                "Solar Pro 4",
+                "Solar Mini 4",
+                "MiMo v2.6 Flash Slow",
+                "DeepSeek V4.1 Flash Slow • high",
+                "DeepSeek V4.1 Flash 10/17 • high",
+            ]
+        );
+        assert_eq!(picker.current, Some(5));
+        assert!(picker.cards[5].current);
+        assert_eq!(picker.cards[4].section.as_deref(), Some("PREMIUM"));
+        // The body line, verbatim, one per card.
+        assert_eq!(
+            picker.cards[0].detail.as_deref(),
+            Some("1x · Preview model: prompts and outputs may be retained for training")
+        );
+        assert_eq!(picker.cards[3].detail.as_deref(), Some("1x"));
+        assert_eq!(
+            picker.cards[5].detail.as_deref(),
+            Some("3x · May use data for AI training")
+        );
+        // No cost line: the notice is the body line.
+        assert_eq!(picker.cards[2].detail, None);
+        assert_eq!(
+            picker.cards[2].note.as_deref(),
+            Some("May use data for AI training")
+        );
+        assert_eq!(picker.cards[4].tagline.as_deref(), Some("Slow"));
+    }
+
+    #[test]
+    fn the_wide_capture_reads_seven_cards_without_cost_lines() {
+        let picker = parse(&rows_of(PICKER_140)).expect("a picker");
+        let names: Vec<&str> = picker.cards.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "DeepSeek V4.1 Flash 10/17 • high",
+                "MiMo v2.6 Flash Fast",
+                "Muse Spark 1.3 • high",
+                "GLM 5.3 Flash • high",
+                "GPT-6 Luna • high",
+                "MiMo 2.6 Pro",
+                "DeepSeek V4.1 Flash Fast 10/17 • high",
+            ]
+        );
+        assert_eq!(picker.current, Some(1));
+        assert_eq!(picker.cards[0].section.as_deref(), Some("OPTIMIZED"));
+        assert_eq!(picker.cards[6].section.as_deref(), Some("POWERFUL"));
+        // At this width the body line is prose, and there is no cost line.
+        assert_eq!(
+            picker.cards[0].note.as_deref(),
+            Some("Recommended · May use data for AI training")
+        );
+        assert_eq!(picker.cards[1].detail, None);
+        assert_eq!(picker.cards[1].note, None);
+        assert_eq!(picker.cards[1].tagline.as_deref(), Some("Balanced"));
+    }
+
+    #[test]
+    fn the_clipped_last_box_is_still_a_card() {
+        // The saved 140x45 frame ends inside the last box: the status line
+        // overwrote its closing border. The next opening border, or the end of
+        // the region, is the boundary.
+        let picker = parse(&rows_of(PICKER_140)).expect("a picker");
+        assert_eq!(picker.cards.len(), 7);
+        assert_eq!(
+            picker.cards[6].note.as_deref(),
+            Some("May use data for AI training")
+        );
+    }
+
+    #[test]
+    fn a_notice_box_is_not_a_card() {
+        // A tip box has a border and prose, and no ` · ` in its first line. It
+        // must stay out of the catalog, because the console would offer it as
+        // a model.
+        let lines: Vec<String> = [
+            " ┌──────────────────────────────────────────┐",
+            " │ ✦ Refer friends → earn hours:            │",
+            " │ ⎘ Copy invite link  Learn More ↵         │",
+            " └──────────────────────────────────────────┘",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(parse(&lines).is_none());
+    }
+
+    #[test]
+    fn nothing_above_the_pickers_footer_is_read() {
+        // The footer row is the picker's own header. A box above it belongs to
+        // the chat's notice area, and one of those carries the balance. The
+        // second line below is a notice that looks exactly like a card: it
+        // must still stay out, which is what the region cut is for.
+        let mut lines: Vec<String> = [
+            " ┌──────────────────────────────────────────┐",
+            " │   Free Hours Pack · 3x · Promotional     │",
+            " └──────────────────────────────────────────┘",
+            " ↑↓ choose model · Tab reasoning · Enter select · Esc cancel",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        lines.extend(rows_of(PICKER_80));
+        let picker = parse(&lines).expect("a picker");
+        assert!(picker.cards.iter().all(|c| c.name != "Free Hours Pack"));
+        assert_eq!(picker.cards.len(), 6);
     }
 }
