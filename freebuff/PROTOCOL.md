@@ -25,7 +25,7 @@ refused.
 The driver is a console-less child. It must not open a window, and it must not
 read the daemon's own secrets: it inherits the user's environment, nothing more.
 
-## 2. Two modes
+## 2. Three modes
 
 ### `--probe`
 
@@ -52,6 +52,43 @@ Rules the console relies on:
 * `reason` is shown verbatim. Keep it one sentence, in plain language, and
   never put a token, a key or an account address in it.
 
+### `--catalog`
+
+Opens Freebuff's model picker, reads every row it shows, writes `models.json`
+into its working directory (the plugin folder), and prints the same JSON as one
+line on stdout. Always exit 0, for the same reason as `--probe`: a picker that
+could not be read is an answer, not a driver failure.
+
+```json
+{"captured_at":1793650406878,"default":"DeepSeek V4.1 Flash 10/17 • high","models":[{"model":"DeepSeek V4.1 Flash 10/17 • high","display_name":"DeepSeek V4.1 Flash 10/17 • high","detail":"3x · May use data for AI training","is_default":true}]}
+```
+
+| key | type | meaning |
+|-----|------|---------|
+| `captured_at` | number | when the picker was read, milliseconds since the epoch; `0` when nothing was read |
+| `default` | string or null | the row the picker had marked before any arrow, which is the model Freebuff runs now |
+| `models` | array | the picker's cards in the order it shows them, in Freebuff's own words |
+| `reason` | string or null | present instead of an answer when the read failed: one plain sentence |
+
+Each model carries `model`, `display_name`, `detail` (the row's cost line,
+verbatim), `note` (the data-use or plan notice printed under a name) and
+`is_default`. That is the daemon's own model descriptor, so `models.json` parses
+as the catalog the console shows, and the fields the daemon has and Freebuff does
+not are simply absent.
+
+Rules this mode keeps:
+
+* It is the only mode that opens the picker purely to read it. It starts a
+  throwaway chat inside the plugin folder's `.catalog-cwd/`, so the project
+  folder that chat lands in always has the same name, and it types nothing into
+  it beyond the keys that walk the list.
+* It never presses a key on a screen it has not read. `escape` is the only key
+  sent after the last parsed picker, and it is sent whether the read worked or
+  not, so a half-open list is never left for the next chat.
+* A failed write of `models.json` is not a failure of the answer: the daemon
+  falls back to the manifest's shipped list when the file is missing or
+  unreadable.
+
 ### Session mode
 
 With no arguments the driver reads commands on stdin and writes events on
@@ -75,20 +112,29 @@ exits.
 | `prompt` | `text` | send one user prompt |
 | `interrupt` | none | cancel the open turn |
 | `answer` | `harness_ref`, `choice` | answer an approval request |
-| `settings` | `model`, `effort`, `fast`, `permission_mode` | change a setting, or refuse |
+| `settings` | `model`, `effort`, `fast`, `permission_mode` | change the model in the running chat, or refuse the rest |
 | `shutdown` | none | end the driver and its harness process |
 
 `spawn` is the first command and comes once. `cwd` is the chat's working
 directory; it must exist. `resume` is a `session_ref` this driver reported
 earlier, or absent for a new chat. `model`, `effort`, `fast`,
 `permission_mode` are optional: `null` or absent means the daemon has no
-preference. This harness advertises no models, so in practice they are absent.
+preference.
+
+`model` is a name from this plugin's catalog (`--catalog`), a picker row in
+Freebuff's own words. It is matched exactly after trimming, never by nearest
+row: a name that differs in case or punctuation is a refusal, not a guess.
+`effort`, `fast` and `permission_mode` have no word in Freebuff; a `settings`
+command carrying one is refused in a sentence rather than given an invented
+value.
 
 ## 4. Events: driver to daemon
 
 | `type` | fields |
 |--------|--------|
 | `initialized` | `session_ref`, `model`, `permission_mode` |
+| `model_reported` | `model` |
+| `settings_refused` | `message` |
 | `text`, `text_delta` | `text` |
 | `reasoning`, `reasoning_delta` | `text` |
 | `tool_started` | `tool_use_id`, `name`, `input` |
@@ -106,6 +152,10 @@ Two rules that matter more than the table:
    driver will not produce another event. Emit it once.
 2. **A turn is reported exactly once.** `turn_completed` ends the open turn and
    only then may the next `prompt` be answered.
+3. **`model_reported` is the screen's own answer.** It carries the model the
+   driver read off Freebuff's picker, so a chat's chip follows what the TUI
+   actually runs. `settings_refused` carries one sentence saying why a change
+   did not happen, and the daemon shows it as a note in the chat.
 
 ## 5. What this driver does with each command
 
@@ -125,12 +175,44 @@ Two rules that matter more than the table:
    takes no prompt argument, so the prompt arrives later, as input.
 5. Wait for the TUI to paint and then be quiet for 800 ms (bounded at 8 s) and
    for Freebuff's chat directory to appear (bounded at 20 s).
-6. Emit `initialized` once, with `session_ref` set to the chat directory's own
+6. When `model` is present, put the chat on it. The driver types `/model` and
+   Enter, reads the row the picker marks, and compares it with `model`: equal
+   means no arrow is pressed at all. Otherwise it walks with Down, reading the
+   picker after each press, until the marked row is the wanted name; then Enter
+   selects it and the driver reopens the picker to prove the mark landed there.
+   Nothing here types a prompt and nothing answers a spend dialog: the only
+   keys are `/model`, Enter, Down and Escape. The rules that bound the walk:
+   * **No keystroke without a parsed screen.** A key is sent only after the
+     screen has been read and is known not to be the picker when Enter would
+     mean "select". A startup notice, a survey or an ad can swallow the first
+     `/model`, so opening the picker is attempted twice, then refused in a
+     sentence.
+   * **The picker is a structural fact.** It is a screen with at least two
+     distinct model cards and a marked row; a single card, a transcript or a
+     survey is never read as one. A screen carrying an escape sequence this
+     driver's grid does not implement is unreadable until it is repainted, and
+     unreadable means no keys.
+   * **Exact match, no nearest row.** The wanted name must equal the marked
+     row after trimming, character for character. The walk is bounded at 240
+     presses and also stops when the mark has not moved for two presses, which
+     is how the bottom of the wrapped list is found.
+7. Emit `initialized` once, with `session_ref` set to the chat directory's own
    name, which is what `--continue` takes.
 
-`model` is always `null` in `initialized`: the CLI has no way to report the
-model it is using, and the manifest advertises none. `permission_mode` is
-echoed from `spawn` unchanged.
+`model` in `initialized` is the model the picker proved when a switch was
+verified, the requested one when the picker could not be read, and `null` when
+`spawn` named none. `permission_mode` is echoed from `spawn` unchanged.
+
+A switch that fails does not end the chat. It stays alive on the model Freebuff
+runs, `initialized` names the model the picker showed (the requested name when
+the picker could not be read at all), and the first `prompt` is refused with a
+`turn_completed` error naming both the wanted and the actual model, so nothing
+is spent on a model the person did not choose. A chat that was put right by a
+later settings change is not stuck behind that refusal.
+
+Freebuff remembers the last model chosen for the machine, not for the chat. A
+spawn whose model already is that one presses no arrow, and a resumed chat
+re-applies the model it stored by the same verified switch.
 
 ### `prompt`
 
@@ -174,8 +256,25 @@ error, not as `finished`.
 
 ### `settings`
 
-Refused, on stderr and as a `stderr` event. A running Freebuff chat cannot
-switch model, effort, fast mode or permission mode. Stop the chat and resume it.
+The model can be changed on a running chat, between turns. The driver opens
+`/model`, walks to the name and proves it by reopening the picker, exactly as
+at spawn, and the change takes a few seconds because every key waits for the
+TUI to settle. Success is reported as `model_reported` with the model the
+picker proved, which is the truth the console's chip follows.
+
+The rest is refused, on stderr and as a `stderr` event, and where the daemon can
+show it also as `settings_refused` with one sentence:
+
+* `effort`, `fast` or `permission_mode` present: Freebuff has no such word, and
+  the driver will not invent one.
+* a turn in flight: the picker would swallow that turn's keystrokes, so the
+  change waits for the turn to land. The driver never opens the list under a
+  running turn.
+
+A change the driver could not make keeps the chat on the model it had: it emits
+`model_reported` with the model the picker still marks, when that was read, then
+`settings_refused` naming both. The chat keeps running and the next prompt is
+not blocked by it.
 
 ### `answer`
 
@@ -197,6 +296,7 @@ Freebuff is terminated, `closed` is emitted, and the driver exits 0.
 | no progress for 360 s, screen still printing | the same stalled end, naming 360 |
 | Freebuff's own "cannot reach the servers" wording on screen | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Can't reach Freebuff's servers. Retrying… Try another network."}` |
 | Freebuff exits with a turn open | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Freebuff exited before the turn finished"}`, then `closed` |
+| a `prompt` after a model switch failed at spawn | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Freebuff did not switch to <wanted>: it is still on <actual>, so the prompt was not sent. Pick another model, then send it again."}` |
 
 A turn is never left open indefinitely. The chat store this driver reads belongs
 to the CLI, so it can move or stop being written while the CLI is still running;
@@ -223,8 +323,6 @@ on.
 
 ## 7. What this driver never reports
 
-* **Models.** No `models` in the manifest, `model: null` in `initialized`. The
-  console hides its model picker because the manifest declares none.
 * **Approvals.** No `approval_requested` is ever emitted, because Freebuff has
   no approval flow this driver can see. If the TUI ever stops on a question,
   the driver reports it as a diagnostic with the screen text and does not
@@ -234,6 +332,15 @@ on.
 * **Any `text_delta` promise.** Whether Freebuff updates `chat-messages.json`
   during a turn or only at the end is measured behavior, not a contract. When
   it updates at the end, the answer arrives as one `text` event.
+* **A model nobody could read.** A model is reported only after the picker
+  showed it, and a model name is never matched by similarity: an unknown,
+  mistyped or retired name is a refusal that says so, never the nearest row.
+
+The catalog is the one measured model list, and it is measured by `--catalog`
+rather than on every spawn. A spawn that reads the picker for a model choice
+also rewrites `models.json` from the screen it already has, which is a free
+refresh; a catalog capture on its own is an explicit act, run by the console's
+Refresh and refused while a chat on this plugin is alive.
 
 ## 8. Diagnostics
 
@@ -242,6 +349,15 @@ it resolved, the chat id it found, why a turn failed, and, every 30 seconds of
 a turn with no transcript progress, the last readable lines of the TUI. That
 last one exists because Freebuff can stop on something this driver cannot
 answer; quoting the screen is honest, guessing is not.
+
+**Screen text goes to stderr only.** A TUI frame can carry the signed-in
+address, a balance or an account id, so a frame is never put in an event field:
+not in `error_message`, not in `settings_refused`, and not in a note the daemon
+would sync to another device. When a model switch fails, the driver quotes the
+last frame on stderr and the event carries a redacted sentence naming the two
+model names and nothing else. A model name is safe in an event for the same
+reason it is safe in the manifest: it is the harness's own public vocabulary,
+read off its picker.
 
 `FREEBUFF_DRIVER_ACTIVITY_NOTE_SECS` shortens that 30-second window while you
 are developing a driver of your own. It changes no event.
