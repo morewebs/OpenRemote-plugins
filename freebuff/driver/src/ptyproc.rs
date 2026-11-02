@@ -42,11 +42,27 @@ impl PtyProc {
         args: &[String],
         cwd: &std::path::Path,
     ) -> Result<Self, String> {
+        Self::spawn_sized(program, args, cwd, ROWS, COLS)
+    }
+
+    /// Start `program` in a pseudo terminal of exactly `rows` by `cols`.
+    ///
+    /// The size is the TUI's layout, not a preference: Freebuff changes what it
+    /// prints with the window's width, so a mode that reads the picker asks for
+    /// the width that picker was measured at, while a chat keeps the size the
+    /// design specifies.
+    pub fn spawn_sized(
+        program: &std::path::Path,
+        args: &[String],
+        cwd: &std::path::Path,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self, String> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
