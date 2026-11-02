@@ -444,35 +444,135 @@ impl Session {
                 effort,
                 fast,
                 permission_mode,
-            } => {
-                let mut asked: Vec<&str> = Vec::new();
-                if model.is_some() {
-                    asked.push("model");
-                }
-                if effort.is_some() {
-                    asked.push("effort");
-                }
-                if fast.is_some() {
-                    asked.push("fast mode");
-                }
-                if permission_mode.is_some() {
-                    asked.push("permission mode");
-                }
-                if asked.is_empty() {
-                    self.diag("settings carried nothing to apply");
-                } else {
-                    self.diag(&format!(
-                        "a running Freebuff chat cannot change {}; stop the chat and resume it \
-                         to start again with other settings",
-                        asked.join(", ")
-                    ));
-                }
-            }
+            } => self.apply_settings(model, effort, fast, permission_mode),
             Command::Shutdown => {
                 self.diag("shutdown requested; ending the Freebuff session");
                 self.finish(0);
             }
         }
+    }
+
+    /// A `settings` command: change this chat's model in place, or refuse with
+    /// one sentence the console can show.
+    ///
+    /// The TUI is driven from this same loop, pumping the pseudo terminal
+    /// through `settle` while it waits, so a change between turns is safe
+    /// here. It also takes seconds, which is why the attempt says so on stderr
+    /// before the first key is sent.
+    fn apply_settings(
+        &mut self,
+        model: Option<Value>,
+        effort: Option<Value>,
+        fast: Option<Value>,
+        permission_mode: Option<Value>,
+    ) {
+        if let Some(refusal) = self.settings_refusal(&model, &effort, &fast, &permission_mode) {
+            self.diag(&refusal);
+            let _ = self.events.settings_refused(&refusal);
+            return;
+        }
+        let Some(raw) = model.as_ref() else {
+            self.diag("settings carried nothing to apply");
+            return;
+        };
+        // Freebuff takes a model name from its own picker. Anything else in
+        // that field is not a model this chat could switch to, so it is
+        // refused rather than guessed at, the same way `spawn` treats it.
+        let Some(wanted) = wanted_model(Some(raw)) else {
+            let message = "the settings' model is not one of Freebuff's model names, \
+                           so this chat keeps the model it runs";
+            self.diag(message);
+            let _ = self.events.settings_refused(message);
+            return;
+        };
+        if self.pty.is_none() {
+            let message = "Freebuff is not running, so this chat has no model to change";
+            self.diag(message);
+            let _ = self.events.settings_refused(message);
+            return;
+        }
+
+        self.diag(&format!(
+            "driving Freebuff's model picker to change this chat to {wanted}; \
+             this takes a few seconds"
+        ));
+        // A start that never reached its model keeps its block while a change
+        // in a running chat is tried: the chat still runs a model nobody
+        // chose, so no prompt may be sent on it yet.
+        let blocked_at_start = self.model_error.clone();
+        match self.select_model(&wanted) {
+            Ok(()) => {
+                let verified = self
+                    .model_verified
+                    .clone()
+                    .unwrap_or_else(|| wanted.clone());
+                self.diag(&format!("Freebuff runs {verified}"));
+                let _ = self.events.model_reported(&verified);
+            }
+            Err(reason) => {
+                let actual = self
+                    .model_error
+                    .as_ref()
+                    .and_then(|(_, actual)| actual.clone());
+                if blocked_at_start.is_none() {
+                    // This chat started on a model the person chose, so a
+                    // failed change is this event and not a block on the next
+                    // prompt: the message would still run on a model that was
+                    // picked deliberately.
+                    self.model_error = None;
+                }
+                self.diag(&format!("model: {reason}"));
+                if let Some(actual) = actual {
+                    self.diag(&format!("Freebuff still runs {actual}"));
+                    let _ = self.events.model_reported(&actual);
+                }
+                let _ = self.events.settings_refused(&reason);
+            }
+        }
+    }
+
+    /// The first reason this settings change cannot be made, in the order a
+    /// person would want to hear them.
+    ///
+    /// `None` means there is nothing to refuse, so the caller applies what it
+    /// was asked for. Freebuff has a model picker and nothing else: an effort
+    /// word, a fast mode or a permission mode would have to be invented for
+    /// it, and the protocol prefers a sentence to an invented word.
+    pub fn settings_refusal(
+        &self,
+        model: &Option<Value>,
+        effort: &Option<Value>,
+        fast: &Option<Value>,
+        permission_mode: &Option<Value>,
+    ) -> Option<String> {
+        // A settings command that carries nothing is not a refusal; the caller
+        // says so. Anything else waits for the turn that is talking to the
+        // same TUI: a picker opened under a working turn would swallow its
+        // keystrokes.
+        let asked =
+            model.is_some() || effort.is_some() || fast.is_some() || permission_mode.is_some();
+        if asked && self.turn_open {
+            return Some("a turn is in flight; change the model when it lands".to_string());
+        }
+        if effort.is_some() {
+            return Some(
+                "Freebuff has no effort word; only the model can be changed in a running chat"
+                    .to_string(),
+            );
+        }
+        if fast.is_some() {
+            return Some(
+                "Freebuff has no fast mode; only the model can be changed in a running chat"
+                    .to_string(),
+            );
+        }
+        if permission_mode.is_some() {
+            return Some(
+                "Freebuff has no permission mode; only the model can be changed in a running chat"
+                    .to_string(),
+            );
+        }
+        None
     }
 
     fn start(
@@ -863,7 +963,11 @@ impl Session {
         // now, and the only reading taken before an arrow is pressed.
         let first = match self.open_model_picker() {
             Ok(picker) => picker,
-            Err(reason) => return Err(self.refuse_switch(&wanted, None, reason)),
+            Err(reason) => {
+                let reason = self.refuse_switch(&wanted, None, reason);
+                self.leave_no_picker_open();
+                return Err(reason);
+            }
         };
         let mut marked = marked_name(&first);
         self.model_verified = marked.clone();
@@ -897,22 +1001,28 @@ impl Session {
                 break;
             }
             if verdict == WalkVerdict::GiveUp {
-                return Err(self.refuse_switch(
+                let reason = self.refuse_switch(
                     &wanted,
                     marked.clone(),
                     format!("Freebuff does not offer a model called {wanted}"),
-                ));
+                );
+                // The list is still on screen: this chat may be live, and its
+                // next key belongs to the composer.
+                self.leave_no_picker_open();
+                return Err(reason);
             }
             if next_marked == marked {
                 standing += 1;
                 if standing >= MODEL_STANDING_STILL {
                     // Down is not moving the mark any more, so the list is at
                     // its bottom and the wanted name was not in it.
-                    return Err(self.refuse_switch(
+                    let reason = self.refuse_switch(
                         &wanted,
                         marked.clone(),
                         format!("Freebuff does not offer a model called {wanted}"),
-                    ));
+                    );
+                    self.leave_no_picker_open();
+                    return Err(reason);
                 }
             } else {
                 standing = 0;
@@ -927,19 +1037,24 @@ impl Session {
         // the key did not take, and Escape closes it before another key.
         self.press_and_settle("model: enter", Key::Enter);
         if self.read_picker().is_some() {
-            self.press_and_settle("model: escape", Key::Escape);
-            return Err(self.refuse_switch(
+            let reason = self.refuse_switch(
                 &wanted,
                 marked.clone(),
                 "Freebuff did not close its picker".to_string(),
-            ));
+            );
+            self.leave_no_picker_open();
+            return Err(reason);
         }
 
         // 5. Verify the only way this screen allows: open the picker again and
         // read which row it marks. Nothing else proves the switch was taken.
         let reopened = match self.open_model_picker() {
             Ok(picker) => picker,
-            Err(reason) => return Err(self.refuse_switch(&wanted, marked.clone(), reason)),
+            Err(reason) => {
+                let reason = self.refuse_switch(&wanted, marked.clone(), reason);
+                self.leave_no_picker_open();
+                return Err(reason);
+            }
         };
         let verified = marked_name(&reopened);
         self.press_and_settle("model: escape", Key::Escape);
@@ -976,6 +1091,17 @@ impl Session {
             self.diag(&format!("model: after {label} the screen showed: {tail}"));
         }
         reason
+    }
+
+    /// Close whatever a refused change left on screen.
+    ///
+    /// A refusal does not end the chat: a start keeps it alive so the person
+    /// can pick again, and a running chat keeps running. Any later key belongs
+    /// to the composer, so a list the driver gave up on must not be left open
+    /// underneath it. Escape closes a list, a notice or a dialog and never
+    /// selects a row, so it is the one key worth sending here.
+    fn leave_no_picker_open(&mut self) {
+        self.press_and_settle("model: escape after a refusal", Key::Escape);
     }
 
     /// The model `initialized` names.
@@ -1713,6 +1839,30 @@ mod tests {
             .prompt_block()
             .unwrap()
             .contains("did not switch to X"));
+    }
+
+    #[test]
+    fn a_turn_in_flight_refuses_a_model_change_without_touching_the_screen() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        let message = session
+            .settings_refusal(&Some(serde_json::json!("X")), &None, &None, &None)
+            .expect("a refusal");
+        assert!(message.contains("turn"));
+    }
+
+    #[test]
+    fn effort_and_fast_have_no_word_in_freebuff() {
+        let session = Session::new();
+        let message = session
+            .settings_refusal(
+                &None,
+                &Some(serde_json::json!("high")),
+                &Some(serde_json::json!(true)),
+                &None,
+            )
+            .expect("a refusal");
+        assert!(message.contains("effort"));
     }
 
     #[test]

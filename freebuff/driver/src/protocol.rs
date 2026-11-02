@@ -150,9 +150,17 @@ impl Events {
     /// the event for a model change inside a running chat, which the daemon
     /// folds into the session so the console's chip follows what the driver
     /// verified rather than what was asked for.
-    #[allow(dead_code)] // The live settings path emits this next.
     pub fn model_reported(&mut self, model: &str) -> bool {
         self.emit(serde_json::json!({ "type": "model_reported", "model": model }))
+    }
+
+    /// A settings change the driver will not make, as one sentence.
+    ///
+    /// The reason belongs to the harness's own vocabulary, so it travels as
+    /// prose rather than a code: the console shows it as it is, and a new
+    /// reason needs no daemon release.
+    pub fn settings_refused(&mut self, message: &str) -> bool {
+        self.emit(serde_json::json!({ "type": "settings_refused", "message": message }))
     }
 
     pub fn text_delta(&mut self, text: &str) -> bool {
@@ -345,6 +353,28 @@ mod tests {
         assert_eq!(value["session_ref"], serde_json::json!("chat-1"));
         assert_eq!(value["model"], serde_json::Value::Null);
         assert_eq!(value["permission_mode"], serde_json::json!("plan"));
+    }
+
+    #[test]
+    fn a_reported_model_is_one_line_with_its_word() {
+        let (mut events, buffer) = capture();
+        assert!(events.model_reported("DeepSeek V4.1 Flash 10/17 • high"));
+        assert_eq!(
+            lines(&buffer),
+            vec![r#"{"model":"DeepSeek V4.1 Flash 10/17 • high","type":"model_reported"}"#]
+        );
+    }
+
+    #[test]
+    fn a_refused_settings_change_carries_one_sentence() {
+        let (mut events, buffer) = capture();
+        assert!(events.settings_refused("a turn is in flight; change the model when it lands"));
+        assert_eq!(
+            lines(&buffer),
+            vec![
+                r#"{"message":"a turn is in flight; change the model when it lands","type":"settings_refused"}"#
+            ]
+        );
     }
 
     #[test]
