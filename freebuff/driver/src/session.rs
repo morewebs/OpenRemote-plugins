@@ -36,6 +36,15 @@ const INTERRUPT_CTRL_C_AFTER: Duration = Duration::from_millis(1200);
 const INTERRUPT_SETTLE: Duration = Duration::from_millis(800);
 /// No transcript progress for this long gets a diagnostic with the screen text.
 const NO_ACTIVITY_NOTE: Duration = Duration::from_secs(30);
+/// A turn that has made no progress for this long is closed as an error.
+///
+/// The driver reads Freebuff's chat store, and that store is internal to the
+/// CLI: it can move, or stop being written, without the CLI dying. When that
+/// happens nothing else in the driver would ever end the turn, and the chat
+/// would sit "working" for ever with nothing in the console to explain it.
+/// Closing it as an error is the honest end: the turn's outcome is unknown,
+/// and a person can retry instead of waiting on a spinner.
+const TURN_LIMIT: Duration = Duration::from_secs(240);
 /// How much of the stripped screen a diagnostic quotes.
 const SCREEN_TAIL: usize = 1200;
 
@@ -51,6 +60,18 @@ fn activity_note_limit() -> Duration {
         .unwrap_or(NO_ACTIVITY_NOTE)
 }
 
+/// How long a turn may go without progress before it is closed as stalled.
+/// `FREEBUFF_DRIVER_TURN_LIMIT_SECS` shortens it while an author is developing
+/// a driver; it changes no event's shape, only how soon the end arrives.
+fn turn_limit() -> Duration {
+    std::env::var("FREEBUFF_DRIVER_TURN_LIMIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .filter(|limit| *limit >= Duration::from_secs(5))
+        .unwrap_or(TURN_LIMIT)
+}
+
 /// Bracketed paste: the TUI inserts the text.
 fn bracketed_paste(text: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(text.len() + 16);
@@ -58,6 +79,12 @@ fn bracketed_paste(text: &str) -> Vec<u8> {
     bytes.extend_from_slice(text.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
     bytes
+}
+
+/// Whether a turn has gone quiet for long enough to be closed as stalled.
+/// Kept as a plain function so the rule is testable without waiting minutes.
+fn stalled(idle: Duration, limit: Duration) -> bool {
+    idle >= limit
 }
 
 #[derive(Debug)]
@@ -614,15 +641,11 @@ impl Session {
         if self.last_progress.elapsed() < limit {
             return;
         }
-        if let Some(at) = self.last_activity_note {
-            if at.elapsed() < limit {
-                return;
-            }
-        }
-        self.last_activity_note = Some(Instant::now());
 
         if self.screen.contains("Can't reach Freebuff's servers")
-            || self.screen.contains("Can\u{2019}t reach Freebuff\u{2019}s servers")
+            || self
+                .screen
+                .contains("Can\u{2019}t reach Freebuff\u{2019}s servers")
             || self.screen.contains("Try another network")
         {
             self.end_turn(Some(
@@ -630,6 +653,31 @@ impl Session {
             ));
             return;
         }
+
+        // Nothing has arrived for the whole turn window: the store this driver
+        // reads is not being written for this chat any more. End it as an
+        // error rather than leave the chat waiting on a spinner for ever.
+        if stalled(self.last_progress.elapsed(), turn_limit()) {
+            // The screen quote stays a diagnostic: `error_message` is held to
+            // the redacted, clipped shape this protocol promises, and a TUI
+            // frame can carry an account string.
+            let screen = self.screen_tail();
+            if !screen.is_empty() {
+                self.diag(&format!("the TUI is showing: {screen}"));
+            }
+            self.end_turn(Some(format!(
+                "Freebuff reported nothing for {} seconds; the turn was closed as stalled",
+                turn_limit().as_secs()
+            )));
+            return;
+        }
+
+        if let Some(at) = self.last_activity_note {
+            if at.elapsed() < limit {
+                return;
+            }
+        }
+        self.last_activity_note = Some(Instant::now());
 
         let screen = self.screen_tail();
         if screen.is_empty() {
@@ -800,5 +848,39 @@ mod tests {
         session.screen = "Error: Can't reach Freebuff's servers. Try another network".to_string();
         session.note_no_activity();
         assert!(!session.turn_open);
+    }
+
+    #[test]
+    fn a_turn_that_never_progresses_is_closed_instead_of_hanging() {
+        // The store this driver reads can stop being written without the CLI
+        // dying. Before the watchdog such a turn stayed open for ever, so the
+        // console showed a spinner and nothing else.
+        assert!(!stalled(Duration::from_secs(30), Duration::from_secs(240)));
+        assert!(stalled(Duration::from_secs(240), Duration::from_secs(240)));
+        assert!(stalled(Duration::from_secs(600), Duration::from_secs(240)));
+    }
+
+    #[test]
+    fn a_stalled_turn_reports_an_error_and_clears_the_turn() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        session.last_progress = Instant::now() - turn_limit() - Duration::from_secs(1);
+        session.screen = "some TUI text".to_string();
+
+        session.note_no_activity();
+
+        assert!(!session.turn_open, "a stalled turn must not stay open");
+        assert!(session.interrupting.is_none());
+    }
+
+    #[test]
+    fn a_turn_with_progress_is_left_alone() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        session.last_progress = Instant::now();
+
+        session.note_no_activity();
+
+        assert!(session.turn_open, "a fresh turn must not be closed");
     }
 }

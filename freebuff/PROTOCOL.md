@@ -1,4 +1,4 @@
-﻿# PROTOCOL.md - the driver protocol this plugin speaks
+# PROTOCOL.md - the driver protocol this plugin speaks
 
 This is the contract between OpenRemote and `freebuff-driver.exe`. It is
 written so that a third party can write their own harness plugin against it
@@ -185,7 +185,16 @@ Freebuff is terminated, `closed` is emitted, and the driver exits 0.
 | `Main prompt finished` | `{"type":"turn_completed","subtype":"finished","coarse":"completed","is_error":false}` |
 | a line with `Validation failed` or `fetch failed` | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"<the msg field, redacted>"}` |
 | `interrupt` given by the daemon | `{"type":"turn_completed","subtype":"interrupted","coarse":"interrupted","is_error":false}` |
+| no transcript or log progress for 240 s | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Freebuff reported nothing for 240 seconds; the turn was closed as stalled"}` |
 | Freebuff exits with a turn open | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Freebuff exited before the turn finished"}`, then `closed` |
+
+A turn is never left open indefinitely. The chat store this driver reads belongs
+to the CLI, so it can move or stop being written while the CLI is still running;
+without the stalled-turn end above, such a turn would sit "working" in the
+console for ever with nothing to explain it. The stall end says the outcome is
+unknown and lets the user retry, which is honest where a spinner is not.
+`FREEBUFF_DRIVER_TURN_LIMIT_SECS` changes the 240-second window; a value under
+5 is ignored.
 
 `error_message` is the log line's `msg` field, with anything address- or
 token-shaped replaced by `<redacted>` and the text clipped. Freebuff's log lines

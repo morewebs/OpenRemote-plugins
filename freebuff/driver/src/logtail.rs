@@ -203,11 +203,12 @@ mod tests {
 
     #[test]
     fn session_over_and_reachability_errors_are_error_turns() {
-        let session_over =
-            r#"{"level":"INFO","msg":"[chat-runtime] Freebuff session over; holding queued messages until rejoin"}"#;
+        let session_over = r#"{"level":"INFO","msg":"[chat-runtime] Freebuff session over; holding queued messages until rejoin"}"#;
         match classify_line(session_over) {
             Some(TurnSignal::Failed(text)) => {
-                assert!(text.contains("Freebuff session over; holding queued messages until rejoin"));
+                assert!(
+                    text.contains("Freebuff session over; holding queued messages until rejoin")
+                );
             }
             other => panic!("expected a failure, got {other:?}"),
         }

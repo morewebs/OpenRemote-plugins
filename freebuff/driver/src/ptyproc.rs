@@ -179,7 +179,9 @@ pub fn is_port_listening(addr: &str, timeout: std::time::Duration) -> bool {
 }
 
 fn var_is_set(key: &str) -> bool {
-    std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false)
+    std::env::var(key)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Inherit environment variables from the parent process into `CommandBuilder`,
@@ -334,7 +336,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}");
-        assert!(is_port_listening(&addr, std::time::Duration::from_millis(200)));
+        assert!(is_port_listening(
+            &addr,
+            std::time::Duration::from_millis(200)
+        ));
         drop(listener);
     }
 }
