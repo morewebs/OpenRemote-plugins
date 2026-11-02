@@ -24,9 +24,14 @@ pub fn classify_line(line: &str) -> Option<TurnSignal> {
     if line.contains("Main prompt finished") {
         return Some(TurnSignal::Finished);
     }
+    // `[chat-runtime] Freebuff session over; holding queued messages until
+    // rejoin` is deliberately not here. Freebuff writes it in its first second
+    // whenever the previous CLI did not exit cleanly - an app closed mid-chat,
+    // a killed process - and it says nothing about the turn being run now. It
+    // is a startup notice, and treating it as a failure killed the next turn
+    // on the spot with a sentence about a session that had already ended.
     if line.contains("Validation failed")
         || line.contains("fetch failed")
-        || line.contains("Freebuff session over; holding queued messages until rejoin")
         || line.contains("offline")
         || line.contains("Can't reach Freebuff's servers")
         || line.contains("Health check failed")
@@ -202,17 +207,16 @@ mod tests {
     }
 
     #[test]
-    fn session_over_and_reachability_errors_are_error_turns() {
+    fn the_resume_notice_is_not_a_turn_failure() {
+        // Written in the first second of a launch after a CLI that did not
+        // exit cleanly. It is about a session that already ended, so it must
+        // never end the turn being run now.
         let session_over = r#"{"level":"INFO","msg":"[chat-runtime] Freebuff session over; holding queued messages until rejoin"}"#;
-        match classify_line(session_over) {
-            Some(TurnSignal::Failed(text)) => {
-                assert!(
-                    text.contains("Freebuff session over; holding queued messages until rejoin")
-                );
-            }
-            other => panic!("expected a failure, got {other:?}"),
-        }
+        assert_eq!(classify_line(session_over), None);
+    }
 
+    #[test]
+    fn reachability_errors_are_error_turns() {
         let offline_line = r#"{"level":"ERROR","msg":"gateway reported offline mode"}"#;
         match classify_line(offline_line) {
             Some(TurnSignal::Failed(text)) => {
