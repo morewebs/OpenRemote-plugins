@@ -13,3 +13,9 @@ desktop.ini
 *.log
 *.jsonl
 !PROTOCOL.md
+
+# The catalog capture: the throwaway Freebuff project it starts, and the
+# catalog it writes next to the driver. Both are produced at run time, and the
+# manifest carries the model list a fresh install ships with.
+.catalog-cwd/
+models.json

@@ -366,47 +366,17 @@ impl Session {
             self.fail_closed(&format!("the chat directory {cwd} does not exist"));
         }
 
-        let exe = match probe::freebuff_path() {
-            Some(exe) => exe,
-            None => {
-                let expected = probe::manicode_dir()
-                    .map(|dir| {
-                        dir.join(if cfg!(windows) {
-                            "freebuff.exe"
-                        } else {
-                            "freebuff"
-                        })
-                    })
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "~/.config/manicode/freebuff".to_string());
-                self.fail_closed(&format!("Freebuff CLI not found at {expected}"));
-            }
-        };
-
-        match probe::read_version(&exe) {
-            Ok(version) => {
-                if !probe::version_at_least(&version, probe::MIN_VERSION) {
-                    self.fail_closed(&format!(
-                        "Freebuff CLI {version} is older than the {}.{}.{} this driver needs; \
-                         update Freebuff and try again",
-                        probe::MIN_VERSION.0,
-                        probe::MIN_VERSION.1,
-                        probe::MIN_VERSION.2
-                    ));
-                }
-                self.diag(&format!("Freebuff {version} at {}", exe.display()));
-            }
+        // The CLI, its version and the sign-in are the same three checks the
+        // catalog capture makes, so they live in one place.
+        let preflight = match probe::preflight() {
+            Ok(preflight) => preflight,
             Err(reason) => self.fail_closed(&reason),
-        }
-
-        match probe::credentials_present() {
-            Some(false) => self.fail_closed(
-                "Freebuff is not signed in; run `freebuff login` once in a terminal, \
-                 then start the chat again",
-            ),
-            None => self.diag("could not locate Freebuff's config directory"),
-            Some(true) => {}
-        }
+        };
+        self.diag(&format!(
+            "Freebuff {} at {}",
+            preflight.version,
+            preflight.exe.display()
+        ));
 
         let resume = resume.filter(|id| !id.trim().is_empty());
         let mut args: Vec<String> = vec!["--cwd".to_string(), cwd_path.display().to_string()];
@@ -426,7 +396,7 @@ impl Session {
         self.model = model;
         self.permission_mode = permission_mode;
 
-        let pty = match PtyProc::spawn(&exe, &args, &cwd_path) {
+        let pty = match PtyProc::spawn(&preflight.exe, &args, &cwd_path) {
             Ok(pty) => pty,
             Err(reason) => self.fail_closed(&reason),
         };

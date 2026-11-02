@@ -1,8 +1,10 @@
 //! OpenRemote harness driver for the Freebuff CLI.
 //!
-//! Two modes, both specified in `PROTOCOL.md`:
+//! Three modes, all specified in `PROTOCOL.md`:
 //!
 //! * `--probe` prints one JSON line about the CLI on this machine and exits.
+//! * `--catalog` opens Freebuff's model picker, writes `models.json` next to
+//!   the driver, and prints the same JSON on one line.
 //! * with no arguments it speaks protocol v1 on stdin and stdout: one JSON
 //!   command per line in, one JSON event per line out, diagnostics on stderr.
 //!
@@ -10,6 +12,7 @@
 //! ConPTY and types prompts into it; the events come from the chat store
 //! Freebuff writes, never from scraping the screen.
 
+mod catalog;
 mod chatdir;
 mod keys;
 mod logtail;
@@ -26,9 +29,10 @@ use std::io::Write;
 const USAGE: &str = "\
 freebuff-driver - OpenRemote harness driver for the Freebuff CLI
 
-  freebuff-driver --probe   print one JSON line: available, version, signed_in, reason
-  freebuff-driver           speak driver protocol v1 on stdin and stdout
-  freebuff-driver --help    this text
+  freebuff-driver --probe     print one JSON line: available, version, signed_in, reason
+  freebuff-driver --catalog   read Freebuff's model picker, write models.json, print one JSON line
+  freebuff-driver             speak driver protocol v1 on stdin and stdout
+  freebuff-driver --help      this text
 
 Exit codes: 0 ok, 1 the session ended with an error, 2 bad arguments.
 ";
@@ -44,6 +48,12 @@ fn main() {
             let _ = writeln!(stdout, "{}", report.to_json());
             let _ = stdout.flush();
             0
+        }
+        Some("--catalog") => {
+            // Same contract as `--probe`: one JSON line and exit 0, because an
+            // unavailable CLI or an unreadable screen is still an answer the
+            // console can show.
+            catalog::run()
         }
         Some("--help") | Some("-h") => {
             let _ = std::io::stdout().write_all(USAGE.as_bytes());

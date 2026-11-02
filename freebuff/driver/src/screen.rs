@@ -233,9 +233,20 @@ impl Screen {
         };
 
         if private {
-            match (body, final_byte) {
-                // Cursor visible / hidden: painting detail, not content.
-                ("25", b'l') | ("25", b'h') => {}
+            match final_byte {
+                // Cursor visibility, bracketed paste, focus reporting,
+                // synchronized output, grapheme width, theme notifications
+                // and sixel scrolling: each one tells the terminal how to
+                // report input or when to present a frame, and none of them
+                // changes a cell. Freebuff's TUI brackets every repaint in
+                // synchronized output, so without this the grid would refuse
+                // a screen that is perfectly readable.
+                b'h' | b'l' if ignorable_mode(body) => {}
+                // A mode query (`CSI ? 2004 $ p`) asks the terminal what it
+                // supports; the answer goes out on the write side, not here.
+                b'p' if body.ends_with('$') => {}
+                // `CSI ? u` asks which keyboard protocol the terminal speaks.
+                b'u' if body.is_empty() => {}
                 _ => self.unparseable = true,
             }
             return;
@@ -254,6 +265,15 @@ impl Screen {
             }
             b'G' => self.col = (n(1) - 1).min(self.width().saturating_sub(1)),
             b'd' => self.row = (n(1) - 1).min(self.height() - 1),
+            // Erase characters: the TUI blanks the tail of a row this way
+            // instead of writing spaces, and the cursor stays put.
+            b'X' => {
+                let row = self.row.min(self.height() - 1);
+                let end = (self.col + n(1)).min(self.width());
+                for col in self.col..end {
+                    self.rows[row][col] = ' ';
+                }
+            }
             b'J' => match numbers.first().copied().flatten().unwrap_or(0) {
                 2 | 3 => {
                     self.clear();
@@ -290,6 +310,27 @@ impl Screen {
                     self.unparseable = true;
                 }
             }
+            // Window and pixel-size reports are queries too (`CSI 14 t` asks
+            // for the text area in pixels). A resize request would be a real
+            // layout change and is not something this grid follows.
+            b't' => {
+                if !matches!(numbers.first().copied().flatten(), Some(14) | Some(18)) {
+                    self.unparseable = true;
+                }
+            }
+            // A mode query without the private prefix: the answer goes out on
+            // the write side.
+            b'p' => {
+                if !params.ends_with('$') {
+                    self.unparseable = true;
+                }
+            }
+            // DECSCUSR sets the cursor shape (`CSI > 0 q`); no cell changes.
+            b'q' => {
+                if !params.starts_with('>') {
+                    self.unparseable = true;
+                }
+            }
             _ => self.unparseable = true,
         }
     }
@@ -318,6 +359,25 @@ impl Screen {
             self.rows[row].iter_mut().for_each(|cell| *cell = ' ');
         }
     }
+}
+
+/// Private modes that change no cell: they tell the terminal how to report
+/// input or when to present a frame, so a screen that switched them on is
+/// still the screen a person sees.
+///
+/// The alternate-screen modes are deliberately absent. Switching buffers
+/// replaces everything on screen, and this grid follows one screen, so a
+/// buffer switch must keep the "I cannot tell" answer.
+fn ignorable_mode(body: &str) -> bool {
+    body.split(';').all(|mode| {
+        matches!(
+            mode,
+            // Cursor visible/hidden, focus reporting, sixel scrolling,
+            // bracketed paste, synchronized output, grapheme width, and
+            // light/dark theme notifications.
+            "25" | "1004" | "1016" | "2004" | "2026" | "2027" | "2031"
+        )
+    })
 }
 
 /// The last few screens the driver acted on, kept so a parse that breaks can
@@ -446,5 +506,33 @@ mod tests {
         let mut screen = Screen::new(10, 20);
         screen.feed(b"keep\r\nwipe\x1b[2K\r\nnext");
         assert_eq!(screen.tail(3), Some(vec!["keep".into(), "next".into()]));
+    }
+
+    #[test]
+    fn erased_characters_are_blanked_without_moving_the_cursor() {
+        let mut screen = Screen::new(5, 20);
+        screen.feed(b"abcdef\x1b[4D\x1b[2X");
+        assert_eq!(screen.tail(1), Some(vec!["ab  ef".into()]));
+    }
+
+    #[test]
+    fn the_terminals_mode_and_query_sequences_do_not_blind_the_grid() {
+        // Measured on Freebuff 0.2.35, whose TUI switches synchronized output
+        // on and off around every repaint and queries its modes before it
+        // paints. None of these change a cell, so the screen stays readable.
+        let mut screen = Screen::new(45, 140);
+        screen.feed(b"\x1b[?2026h\x1b[?2027h\x1b[?2004h\x1b[?1004h\x1b[?2031h");
+        screen.feed(b"\x1b[?2004$p\x1b[?2026$p\x1b[?u\x1b[>0q\x1b[14t");
+        screen.feed(b"models\x1b[?2026l\x1b[m");
+        assert_eq!(screen.tail(1), Some(vec!["models".into()]));
+    }
+
+    #[test]
+    fn an_alternate_screen_still_leaves_the_grid_unable_to_tell() {
+        // Switching buffers replaces the whole screen, so the rows after it
+        // are not a continuation of the rows before it.
+        let mut screen = Screen::new(45, 140);
+        screen.feed(b"before\x1b[?1049h");
+        assert_eq!(screen.tail(1), None);
     }
 }

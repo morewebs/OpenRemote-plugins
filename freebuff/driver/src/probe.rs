@@ -268,6 +268,70 @@ fn clip(text: &str, max: usize) -> String {
     out
 }
 
+/// Where the driver looked for the executable, for the sentence it prints when
+/// the search found nothing.
+fn expected_path() -> String {
+    manicode_dir()
+        .map(|dir| {
+            dir.join(if cfg!(windows) {
+                "freebuff.exe"
+            } else {
+                "freebuff"
+            })
+        })
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "~/.config/manicode/freebuff".to_string())
+}
+
+/// What a mode needs before it types anything: the executable it will start,
+/// and the version it read from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preflight {
+    pub exe: PathBuf,
+    pub version: String,
+}
+
+/// The three checks every mode makes before it starts the TUI: the CLI is
+/// where the driver expects it, it is new enough to be measured against, and
+/// it is signed in. The reasons are the sentences the console shows, so a
+/// person can fix them without reading this source.
+pub fn preflight() -> Result<Preflight, String> {
+    let exe = match freebuff_path() {
+        Some(exe) => exe,
+        None => return Err(format!("Freebuff CLI not found at {}", expected_path())),
+    };
+
+    let version = read_version(&exe)?;
+
+    if let Some(refusal) = version_refusal(&version) {
+        return Err(refusal);
+    }
+
+    match credentials_present() {
+        Some(false) => Err(
+            "Freebuff is not signed in; run `freebuff login` once in a terminal, \
+             then start the chat again"
+                .to_string(),
+        ),
+        // An unreadable config directory is not proof of anything either way:
+        // the CLI was found, so let it start and speak for itself.
+        Some(true) | None => Ok(Preflight { exe, version }),
+    }
+}
+
+/// The sentence an older CLI is refused with, and `None` when the version is
+/// one this driver has been measured against.
+fn version_refusal(version: &str) -> Option<String> {
+    if version_at_least(version, MIN_VERSION) {
+        return None;
+    }
+    let wanted = format!("{}.{}.{}", MIN_VERSION.0, MIN_VERSION.1, MIN_VERSION.2);
+    Some(format!(
+        "Freebuff CLI {version} is older than the {wanted} this driver needs; \
+         update Freebuff and try again"
+    ))
+}
+
 /// Build the probe answer. Never panics, never guesses: a missing CLI, a
 /// failing `-v` or an unreadable config directory each produce a plain reason
 /// the console can show.
@@ -275,17 +339,10 @@ pub fn run() -> ProbeReport {
     let exe = match freebuff_path() {
         Some(exe) => exe,
         None => {
-            let where_ = manicode_dir()
-                .map(|d| {
-                    d.join(if cfg!(windows) {
-                        "freebuff.exe"
-                    } else {
-                        "freebuff"
-                    })
-                })
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "~/.config/manicode/freebuff".to_string());
-            return ProbeReport::unavailable(format!("Freebuff CLI not found at {where_}"));
+            return ProbeReport::unavailable(format!(
+                "Freebuff CLI not found at {}",
+                expected_path()
+            ));
         }
     };
 
@@ -365,6 +422,15 @@ mod tests {
         assert!(!version_at_least("0.2.9", MIN_VERSION));
         assert!(version_at_least("0.10.0", MIN_VERSION));
         assert!(!version_at_least("0.2.34", MIN_VERSION));
+    }
+
+    #[test]
+    fn an_old_cli_is_refused_with_both_versions_in_the_sentence() {
+        let refusal = version_refusal("0.2.9").expect("a refusal");
+        assert!(refusal.contains("0.2.9"), "{refusal}");
+        assert!(refusal.contains("0.2.35"), "{refusal}");
+        assert!(version_refusal("0.2.35").is_none());
+        assert!(version_refusal("0.3.0").is_none());
     }
 
     #[test]
