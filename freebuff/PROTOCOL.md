@@ -137,6 +137,14 @@ echoed from `spawn` unchanged.
 The text is typed into the TUI as a bracketed paste, `ESC[200~`, the text,
 `ESC[201~`, then Enter. Freebuff then works as it normally would.
 
+Freebuff can answer that Enter with its own cost confirmation: the message sits
+in the composer with `Your message is saved.` and `Enter: confirm and send`, and
+nothing starts until a second Enter arrives. The driver presses it, because the
+person already sent the message and that Enter is the same key they would press.
+The count is bounded at 3 per turn, paced at 3 s apart, and it only ever reads
+the part of the screen a person can currently see - a dialog left in the
+scrollback is never answered again.
+
 The driver does not scrape the screen for answers. It reads what Freebuff
 writes into its own chat store:
 
@@ -185,7 +193,9 @@ Freebuff is terminated, `closed` is emitted, and the driver exits 0.
 | `Main prompt finished` | `{"type":"turn_completed","subtype":"finished","coarse":"completed","is_error":false}` |
 | a line with `Validation failed` or `fetch failed` | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"<the msg field, redacted>"}` |
 | `interrupt` given by the daemon | `{"type":"turn_completed","subtype":"interrupted","coarse":"interrupted","is_error":false}` |
-| no transcript or log progress for 240 s | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Freebuff reported nothing for 240 seconds; the turn was closed as stalled"}` |
+| no transcript or log progress for 120 s, screen frozen | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Freebuff reported nothing for 120 seconds; the turn was closed as stalled"}` |
+| no progress for 360 s, screen still printing | the same stalled end, naming 360 |
+| Freebuff's own "cannot reach the servers" wording on screen | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Can't reach Freebuff's servers. Retrying… Try another network."}` |
 | Freebuff exits with a turn open | `{"type":"turn_completed","subtype":"error","coarse":"failed","is_error":true,"error_message":"Freebuff exited before the turn finished"}`, then `closed` |
 
 A turn is never left open indefinitely. The chat store this driver reads belongs
@@ -193,8 +203,18 @@ to the CLI, so it can move or stop being written while the CLI is still running;
 without the stalled-turn end above, such a turn would sit "working" in the
 console for ever with nothing to explain it. The stall end says the outcome is
 unknown and lets the user retry, which is honest where a spinner is not.
-`FREEBUFF_DRIVER_TURN_LIMIT_SECS` changes the 240-second window; a value under
-5 is ignored.
+
+Two rules keep that end from firing on honest work or arriving too late:
+
+* A TUI that has printed within the last 15 seconds is still alive and may be
+  inside one long tool step that writes nothing to the transcript, so it earns
+  three times the window (360 s). A frozen screen gets 120 s.
+* The screen is checked every second for Freebuff's own unreachable-servers
+  wording, so that banner ends the turn in about a second rather than waiting
+  for any window.
+
+`FREEBUFF_DRIVER_TURN_LIMIT_SECS` changes the 120-second window (the live-screen
+window scales with it); a value under 5 is ignored.
 
 `error_message` is the log line's `msg` field, with anything address- or
 token-shaped replaced by `<redacted>` and the text clipped. Freebuff's log lines

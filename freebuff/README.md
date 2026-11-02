@@ -57,9 +57,15 @@ so instead of pretending to be ready.
   chat's working directory and types your prompt into it.
 * Assistant text, the model's reasoning, and tool calls with their results, all
   read from Freebuff's own chat transcript rather than scraped off the screen.
+* Freebuff's own send confirmation: when it asks "Enter: confirm and send" for a
+  message you already sent, the driver presses that Enter (at most three times a
+  turn) so the turn starts instead of waiting for ever.
 * A finished turn, when Freebuff ends one. A turn can never hang for ever: if
-  the transcript and the log stop moving for 240 seconds, the turn is closed as
-  an error that says so, and you can retry instead of watching a spinner.
+  the transcript and the log stop moving for two minutes the turn is closed as
+  an error that says so, and you can retry instead of watching a spinner. A TUI
+  that is still drawing gets six minutes, because a long tool step can run
+  without writing anything. When Freebuff prints its own "cannot reach the
+  servers" wording the turn ends in about a second.
 * Stop and resume: the chat id Freebuff writes is reported as `session_ref`,
   and resuming starts the CLI with `--continue <id>`.
 * Interrupt: Escape, then Ctrl-C if the TUI is still working, then a turn that

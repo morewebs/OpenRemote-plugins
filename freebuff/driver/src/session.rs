@@ -44,7 +44,22 @@ const NO_ACTIVITY_NOTE: Duration = Duration::from_secs(30);
 /// would sit "working" for ever with nothing in the console to explain it.
 /// Closing it as an error is the honest end: the turn's outcome is unknown,
 /// and a person can retry instead of waiting on a spinner.
-const TURN_LIMIT: Duration = Duration::from_secs(240);
+const TURN_LIMIT: Duration = Duration::from_secs(120);
+/// How recently the TUI must have printed for its screen to count as alive.
+/// A live screen earns three times the window (see `stall_window`), because a
+/// TUI that is still drawing may be inside one long tool step that writes
+/// nothing to the transcript.
+const SCREEN_ALIVE: Duration = Duration::from_secs(15);
+/// How often the screen is checked for Freebuff's own "cannot reach the
+/// servers" wording. A second is often enough for a banner and cheap over the
+/// few kilobytes the driver keeps.
+const OFFLINE_CHECK: Duration = Duration::from_secs(1);
+/// How many send confirmations the driver will press in one turn. Freebuff can
+/// ask again after a model switch; an unbounded loop would keep spending.
+const CONFIRM_LIMIT: u32 = 3;
+/// Least time between two confirmations, so a repaint cannot look like a fresh
+/// question and take a second press for the same message.
+const CONFIRM_GAP: Duration = Duration::from_secs(3);
 /// How much of the stripped screen a diagnostic quotes.
 const SCREEN_TAIL: usize = 1200;
 
@@ -87,6 +102,54 @@ fn stalled(idle: Duration, limit: Duration) -> bool {
     idle >= limit
 }
 
+/// How long a turn may stay silent: a frozen screen gets the short window, a
+/// screen that is still printing gets three times as long, because a live TUI
+/// may be inside one long tool step that writes nothing to the transcript.
+fn stall_window(screen_idle: Duration, frozen: Duration) -> Duration {
+    if screen_idle >= SCREEN_ALIVE {
+        frozen
+    } else {
+        frozen * 3
+    }
+}
+
+/// Whether the TUI is showing Freebuff's own "I cannot reach my servers"
+/// wording. Matching is case-insensitive because the CLI's own capitalisation
+/// is not a contract, and these phrases are distinctive enough that assistant
+/// prose is unlikely to contain them.
+fn screen_says_offline(screen: &str) -> bool {
+    let lower = screen.to_lowercase();
+    [
+        "can't reach freebuff's servers",
+        "can\u{2019}t reach freebuff\u{2019}s servers",
+        "try another network",
+        "health check failed",
+        "no internet connection",
+        "check your network connection",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Whether the TUI is holding a typed message behind its own send
+/// confirmation.
+///
+/// Freebuff asks a second time before it spends the account's balance on a
+/// model: the message sits in the composer with "Starting your model
+/// session… Your message is saved." and "Enter: confirm and send". The single
+/// Enter a send ends there, so without a second one the turn never starts and
+/// the transcript stays empty - which looks exactly like a dead CLI.
+fn screen_asks_to_confirm(screen: &str) -> bool {
+    let lower = screen.to_lowercase();
+    [
+        "confirm and send",
+        "enter: confirm",
+        "press enter to confirm",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[derive(Debug)]
 struct InterruptState {
     started: Instant,
@@ -117,6 +180,12 @@ struct Session {
     seen_output: bool,
     last_progress: Instant,
     last_activity_note: Option<Instant>,
+    last_offline_check: Option<Instant>,
+    /// Send confirmations the driver has pressed this turn. Freebuff may ask
+    /// again after a model switch, but a loop here would spend the account's
+    /// balance, so the count is bounded.
+    confirmations: u32,
+    last_confirm_at: Option<Instant>,
     screen: String,
     interrupting: Option<InterruptState>,
     eof_since: Option<Instant>,
@@ -150,6 +219,9 @@ impl Session {
             seen_output: false,
             last_progress: now,
             last_activity_note: None,
+            last_offline_check: None,
+            confirmations: 0,
+            last_confirm_at: None,
             screen: String::new(),
             interrupting: None,
             eof_since: None,
@@ -401,6 +473,9 @@ impl Session {
         self.turn_open = true;
         self.last_progress = Instant::now();
         self.last_activity_note = None;
+        // A fresh turn gets its own confirmation budget.
+        self.confirmations = 0;
+        self.last_confirm_at = None;
     }
 
     /// Read whatever the TUI has printed and keep a stripped tail of it.
@@ -633,6 +708,56 @@ impl Session {
             .turn_completed("interrupted", "interrupted", false, None);
     }
 
+    /// What the screen says about the turn, checked about once a second: an
+    /// unreachable-server banner ends it, and Freebuff's send confirmation gets
+    /// the second Enter it is waiting for.
+    fn scan_screen(&mut self) {
+        if !self.turn_open || self.interrupting.is_some() {
+            return;
+        }
+        if let Some(at) = self.last_offline_check {
+            if at.elapsed() < OFFLINE_CHECK {
+                return;
+            }
+        }
+        self.last_offline_check = Some(Instant::now());
+        if self.screen.is_empty() {
+            return;
+        }
+
+        // The tail, not the whole scrollback: this buffer only grows, so a
+        // dialog that has already been dismissed would keep matching for the
+        // rest of the turn - and a confirmation pressed again and again spends
+        // the account's balance.
+        let tail = self.screen_tail();
+
+        if screen_says_offline(&tail) {
+            self.end_turn(Some(
+                "Can't reach Freebuff's servers. Retrying… Try another network.".to_string(),
+            ));
+            return;
+        }
+
+        // The message the user already sent is waiting on Freebuff's own
+        // cost confirmation. Sending it was their choice; the extra Enter is
+        // the same key they would press, not a decision the driver invents.
+        if screen_asks_to_confirm(&tail) && self.confirmations < CONFIRM_LIMIT {
+            match self.last_confirm_at {
+                Some(at) if at.elapsed() < CONFIRM_GAP => return,
+                _ => {}
+            }
+            self.confirmations += 1;
+            self.last_confirm_at = Some(Instant::now());
+            self.diag(
+                "Freebuff is asking to confirm the send; pressing Enter, as the message \
+                 was already sent",
+            );
+            if let Some(pty) = self.pty.as_ref() {
+                pty.send(b"\r");
+            }
+        }
+    }
+
     fn note_no_activity(&mut self) {
         if !self.turn_open || self.interrupting.is_some() {
             return;
@@ -642,22 +767,11 @@ impl Session {
             return;
         }
 
-        if self.screen.contains("Can't reach Freebuff's servers")
-            || self
-                .screen
-                .contains("Can\u{2019}t reach Freebuff\u{2019}s servers")
-            || self.screen.contains("Try another network")
-        {
-            self.end_turn(Some(
-                "Can't reach Freebuff's servers. Retrying… Try another network.".to_string(),
-            ));
-            return;
-        }
-
         // Nothing has arrived for the whole turn window: the store this driver
         // reads is not being written for this chat any more. End it as an
         // error rather than leave the chat waiting on a spinner for ever.
-        if stalled(self.last_progress.elapsed(), turn_limit()) {
+        let window = stall_window(self.last_output.elapsed(), turn_limit());
+        if stalled(self.last_progress.elapsed(), window) {
             // The screen quote stays a diagnostic: `error_message` is held to
             // the redacted, clipped shape this protocol promises, and a TUI
             // frame can carry an account string.
@@ -667,7 +781,7 @@ impl Session {
             }
             self.end_turn(Some(format!(
                 "Freebuff reported nothing for {} seconds; the turn was closed as stalled",
-                turn_limit().as_secs()
+                window.as_secs()
             )));
             return;
         }
@@ -812,6 +926,10 @@ pub fn run() -> Result<(), String> {
         session.pump_pty();
         session.update_settled();
         session.maybe_send_prompt();
+        // Independent of the poll tick: a "cannot reach the servers" banner
+        // should be noticed in about a second, not on the slower poll of the
+        // chat store.
+        session.scan_screen();
 
         if Instant::now() >= next_poll {
             next_poll = Instant::now() + POLL;
@@ -841,13 +959,126 @@ mod tests {
     }
 
     #[test]
-    fn note_no_activity_detects_offline_screen() {
+    fn the_offline_wording_is_recognized_whatever_its_case() {
+        for screen in [
+            "Can't reach Freebuff's servers",
+            "can't reach Freebuff's servers. Retrying…",
+            "CAN’T REACH FREEBUFF’S SERVERS",
+            "Try another network",
+            "health check failed, backing off",
+            "No internet connection",
+            "please check your network connection",
+        ] {
+            assert!(screen_says_offline(screen), "{screen}");
+        }
+        // Ordinary conversation and chrome are not that banner.
+        for screen in [
+            "Help me write a function that retries a request",
+            "The build finished in 12 seconds",
+            "thinking...",
+            "",
+        ] {
+            assert!(!screen_says_offline(screen), "{screen}");
+        }
+    }
+
+    #[test]
+    fn the_offline_banner_ends_a_turn_within_a_second_not_a_minute() {
         let mut session = Session::new();
         session.turn_open = true;
-        session.last_progress = Instant::now() - Duration::from_secs(60);
-        session.screen = "Error: Can't reach Freebuff's servers. Try another network".to_string();
-        session.note_no_activity();
-        assert!(!session.turn_open);
+        // No transcript progress at all: only the screen check can end this.
+        session.last_progress = Instant::now();
+        session.screen = "Can't reach Freebuff's servers. Retrying…".to_string();
+
+        session.scan_screen();
+
+        assert!(!session.turn_open, "the banner must end the turn");
+    }
+
+    #[test]
+    fn a_quiet_screen_is_not_checked_again_within_the_second() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        session.last_progress = Instant::now();
+        session.last_offline_check = Some(Instant::now());
+        session.screen = "Can't reach Freebuff's servers".to_string();
+
+        session.scan_screen();
+
+        assert!(session.turn_open, "one check a second is enough");
+    }
+
+    #[test]
+    fn the_send_confirmation_is_recognized() {
+        // Verbatim from the TUI that stalled a real turn.
+        let stalled = "│  reply with exactly DIAG▍│ │ Starting your model session… Your message is saved.│ │ Esc: back to draft│ DeepSeek V4.1 Flash 10/17 takes 3 hours from your balance. Enter: confirm and send  Esc: back to draft";
+        assert!(screen_asks_to_confirm(stalled));
+        assert!(screen_asks_to_confirm("Enter: confirm and send"));
+        assert!(screen_asks_to_confirm("press enter to confirm"));
+        // A normal composer is not a confirmation.
+        assert!(!screen_asks_to_confirm("│  reply with exactly DIAG▍│"));
+        assert!(!screen_asks_to_confirm("confirm this file was written"));
+    }
+
+    #[test]
+    fn a_waiting_message_gets_the_second_enter() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        session.last_progress = Instant::now();
+        session.screen =
+            "Starting your model session… Enter: confirm and send  Esc: back to draft".to_string();
+
+        session.scan_screen();
+
+        assert_eq!(
+            session.confirmations, 1,
+            "the driver confirms a message the user already sent"
+        );
+        assert!(session.turn_open, "confirming does not end the turn");
+    }
+
+    #[test]
+    fn the_confirmation_is_bounded_and_paced() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        session.screen = "Enter: confirm and send".to_string();
+
+        // Two presses inside the pacing gap are one press.
+        session.scan_screen();
+        session.last_offline_check = None;
+        session.scan_screen();
+        assert_eq!(session.confirmations, 1, "a repaint is not a new question");
+
+        // Even given all the time in the world, the driver stops pressing.
+        for _ in 0..CONFIRM_LIMIT + 2 {
+            session.last_offline_check = None;
+            session.last_confirm_at = Some(Instant::now() - CONFIRM_GAP - Duration::from_secs(1));
+            session.scan_screen();
+        }
+        assert_eq!(
+            session.confirmations, CONFIRM_LIMIT,
+            "a confirmation loop must not spend without limit"
+        );
+    }
+
+    #[test]
+    fn a_dialog_already_dismissed_does_not_press_again() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        // The dialog is in the scrollback, and the TUI has since drawn over it.
+        session.screen = String::from("Enter: confirm and send  Esc: back to draft\n");
+        for i in 0..20 {
+            session
+                .screen
+                .push_str(&format!("line {i} of the model talking\n"));
+        }
+
+        session.scan_screen();
+
+        assert_eq!(
+            session.confirmations, 0,
+            "only the screen a person can see may be answered"
+        );
     }
 
     #[test]
@@ -855,9 +1086,21 @@ mod tests {
         // The store this driver reads can stop being written without the CLI
         // dying. Before the watchdog such a turn stayed open for ever, so the
         // console showed a spinner and nothing else.
-        assert!(!stalled(Duration::from_secs(30), Duration::from_secs(240)));
-        assert!(stalled(Duration::from_secs(240), Duration::from_secs(240)));
-        assert!(stalled(Duration::from_secs(600), Duration::from_secs(240)));
+        let frozen = Duration::from_secs(120);
+        assert!(!stalled(Duration::from_secs(30), frozen));
+        assert!(stalled(Duration::from_secs(120), frozen));
+        assert!(stalled(Duration::from_secs(600), frozen));
+    }
+
+    #[test]
+    fn a_screen_that_is_still_printing_earns_a_longer_window() {
+        let frozen = Duration::from_secs(120);
+        // The TUI has drawn within the last few seconds: keep waiting longer,
+        // because a tool step can run for minutes without writing anything.
+        assert_eq!(stall_window(Duration::from_secs(2), frozen), frozen * 3);
+        // Nothing drawn for a while: the short window applies.
+        assert_eq!(stall_window(Duration::from_secs(60), frozen), frozen);
+        assert_eq!(stall_window(Duration::from_secs(15), frozen), frozen);
     }
 
     #[test]
@@ -865,12 +1108,31 @@ mod tests {
         let mut session = Session::new();
         session.turn_open = true;
         session.last_progress = Instant::now() - turn_limit() - Duration::from_secs(1);
+        // A frozen screen, which is the case the short window is for.
+        session.last_output = Instant::now() - Duration::from_secs(60);
         session.screen = "some TUI text".to_string();
 
         session.note_no_activity();
 
         assert!(!session.turn_open, "a stalled turn must not stay open");
         assert!(session.interrupting.is_none());
+    }
+
+    #[test]
+    fn a_live_screen_delays_the_stall_end() {
+        let mut session = Session::new();
+        session.turn_open = true;
+        session.last_progress = Instant::now() - turn_limit() - Duration::from_secs(1);
+        // The TUI is still drawing, so the turn gets the longer window.
+        session.last_output = Instant::now();
+        session.screen = "still working".to_string();
+
+        session.note_no_activity();
+
+        assert!(
+            session.turn_open,
+            "a TUI that is still printing may be inside a long tool step"
+        );
     }
 
     #[test]
