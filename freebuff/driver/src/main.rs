@@ -11,7 +11,9 @@
 //! Freebuff writes, never from scraping the screen.
 
 mod chatdir;
+mod keys;
 mod logtail;
+mod picker;
 mod probe;
 mod protocol;
 mod ptyproc;

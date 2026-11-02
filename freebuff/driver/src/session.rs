@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::Value;
 
 use crate::chatdir::{self, ChatDir};
+use crate::keys::{self, Key};
 use crate::logtail::{LogTail, TurnSignal};
 use crate::probe;
 use crate::protocol::{parse_command, Command, Events};
@@ -110,6 +111,43 @@ fn stall_window(screen_idle: Duration, frozen: Duration) -> Duration {
         frozen
     } else {
         frozen * 3
+    }
+}
+
+/// How often a settle loop pumps the PTY while it waits. The TUI paints in
+/// bursts, so a shorter step only wastes wake-ups, and a longer one could miss
+/// the quiet window it is looking for.
+const SETTLE_TICK: Duration = Duration::from_millis(25);
+
+/// What a settle loop should do after looking at the screen and the clock.
+/// Kept as a plain enum so the rule can be tested without a pseudo terminal.
+#[allow(dead_code)] // The catalog capture and the model walk wait on this next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// The TUI has not printed for the quiet window: its screen is readable.
+    Quiet,
+    /// The limit was spent while the TUI was still printing. Read the screen
+    /// anyway and decide from what is there; never assume it is ready.
+    TimedOut,
+    /// Keep pumping: the TUI printed recently and the limit is not spent.
+    Waiting,
+}
+
+/// The settle rule: quiet wins as soon as the TUI has been silent long enough,
+/// and otherwise the limit is the only way out.
+#[allow(dead_code)] // Called by `settle`, which the model walk uses next.
+pub fn settle_verdicts(
+    last_output_elapsed: Duration,
+    quiet: Duration,
+    waited: Duration,
+    limit: Duration,
+) -> SettleOutcome {
+    if last_output_elapsed >= quiet {
+        SettleOutcome::Quiet
+    } else if waited >= limit {
+        SettleOutcome::TimedOut
+    } else {
+        SettleOutcome::Waiting
     }
 }
 
@@ -440,7 +478,7 @@ impl Session {
         }
         self.diag("interrupt: sending Escape to Freebuff");
         if let Some(pty) = self.pty.as_ref() {
-            pty.send(b"\x1b");
+            pty.send(&keys::bytes(Key::Escape));
         }
         self.interrupting = Some(InterruptState {
             started: Instant::now(),
@@ -471,7 +509,7 @@ impl Session {
         if let Some(pty) = self.pty.as_ref() {
             pty.send(&bracketed_paste(&text));
             std::thread::sleep(Duration::from_millis(250));
-            pty.send(b"\r");
+            pty.send(&keys::bytes(Key::Enter));
         }
         self.prompt_count += 1;
         self.turn_open = true;
@@ -510,6 +548,28 @@ impl Session {
         if self.interrupting.is_some() {
             // Any repaint counts as the TUI still working on the cancel.
             self.last_progress = Instant::now();
+        }
+    }
+
+    /// Pump the PTY until the TUI has stopped printing for `quiet`, or until
+    /// `limit` has been spent. Returns true when it went quiet and false when
+    /// the limit ran out; callers are expected to read the screen either way,
+    /// because a timed-out settle means "look at what is there", never "assume
+    /// the TUI is ready".
+    ///
+    /// The clock is the TUI's own last output, so a screen that was already
+    /// quiet settles at once. A caller that has just pressed a key and needs
+    /// the repaint before reading should wait for output another way.
+    #[allow(dead_code)] // The catalog capture and the model walk wait on this.
+    pub fn settle(&mut self, quiet: Duration, limit: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            self.pump_pty();
+            match settle_verdicts(self.last_output.elapsed(), quiet, started.elapsed(), limit) {
+                SettleOutcome::Quiet => return true,
+                SettleOutcome::TimedOut => return false,
+                SettleOutcome::Waiting => std::thread::sleep(SETTLE_TICK),
+            }
         }
     }
 
@@ -763,7 +823,7 @@ impl Session {
                  was already sent",
             );
             if let Some(pty) = self.pty.as_ref() {
-                pty.send(b"\r");
+                pty.send(&keys::bytes(Key::Enter));
             }
         }
     }
@@ -1156,5 +1216,47 @@ mod tests {
         session.note_no_activity();
 
         assert!(session.turn_open, "a fresh turn must not be closed");
+    }
+
+    #[test]
+    fn settle_reports_quiet_once_the_tui_stopped_printing() {
+        use SettleOutcome::*;
+        assert_eq!(
+            settle_verdicts(
+                Duration::from_millis(400),
+                Duration::from_millis(350),
+                Duration::from_secs(1),
+                Duration::from_secs(3)
+            ),
+            Quiet
+        );
+    }
+
+    #[test]
+    fn settle_gives_up_at_the_limit_instead_of_waiting_for_ever() {
+        use SettleOutcome::*;
+        assert_eq!(
+            settle_verdicts(
+                Duration::from_millis(50),
+                Duration::from_millis(350),
+                Duration::from_secs(3),
+                Duration::from_secs(3)
+            ),
+            TimedOut
+        );
+    }
+
+    #[test]
+    fn settle_waits_while_the_tui_is_still_printing() {
+        use SettleOutcome::*;
+        assert_eq!(
+            settle_verdicts(
+                Duration::from_millis(50),
+                Duration::from_millis(350),
+                Duration::from_secs(1),
+                Duration::from_secs(3)
+            ),
+            Waiting
+        );
     }
 }
