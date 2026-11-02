@@ -186,7 +186,10 @@ struct Session {
     /// balance, so the count is bounded.
     confirmations: u32,
     last_confirm_at: Option<Instant>,
-    screen: String,
+    /// The screen a person sees. Matchers read this, never the stripped text.
+    screen: crate::screen::Screen,
+    /// Stripped text, for diagnostics only: a frame can carry an account string.
+    frame_text: String,
     interrupting: Option<InterruptState>,
     eof_since: Option<Instant>,
     prompt_count: u32,
@@ -222,7 +225,8 @@ impl Session {
             last_offline_check: None,
             confirmations: 0,
             last_confirm_at: None,
-            screen: String::new(),
+            screen: crate::screen::Screen::new(crate::ptyproc::ROWS, crate::ptyproc::COLS),
+            frame_text: String::new(),
             interrupting: None,
             eof_since: None,
             prompt_count: 0,
@@ -489,14 +493,19 @@ impl Session {
         }
         self.seen_output = true;
         self.last_output = Instant::now();
-        self.screen.push_str(&crate::ptyproc::strip_ansi(&bytes));
-        if self.screen.len() > 8 * SCREEN_TAIL {
-            let cut = self.screen.len() - 4 * SCREEN_TAIL;
+        // Two consumers, two views: the grid is what a matcher may read (the
+        // screen a person sees), the stripped text is only ever quoted in a
+        // diagnostic.
+        self.screen.feed(&bytes);
+        self.frame_text
+            .push_str(&crate::ptyproc::strip_ansi(&bytes));
+        if self.frame_text.len() > 8 * SCREEN_TAIL {
+            let cut = self.frame_text.len() - 4 * SCREEN_TAIL;
             let mut start = cut;
-            while start < self.screen.len() && !self.screen.is_char_boundary(start) {
+            while start < self.frame_text.len() && !self.frame_text.is_char_boundary(start) {
                 start += 1;
             }
-            self.screen = self.screen[start..].to_string();
+            self.frame_text = self.frame_text[start..].to_string();
         }
         if self.interrupting.is_some() {
             // Any repaint counts as the TUI still working on the cancel.
@@ -721,14 +730,15 @@ impl Session {
             }
         }
         self.last_offline_check = Some(Instant::now());
-        if self.screen.is_empty() {
+        if self.screen.tail(1).is_none() {
+            // The grid could not follow the last repaint: nothing here is
+            // something a person is looking at, so no matcher may read it.
             return;
         }
 
-        // The tail, not the whole scrollback: this buffer only grows, so a
-        // dialog that has already been dismissed would keep matching for the
-        // rest of the turn - and a confirmation pressed again and again spends
-        // the account's balance.
+        // The tail, not the whole screen: rows from an older frame must not
+        // match, or a dismissed dialog would be answered again - and a
+        // confirmation pressed again and again spends the account's balance.
         let tail = self.screen_tail();
 
         if screen_says_offline(&tail) {
@@ -809,18 +819,12 @@ impl Session {
 
     /// The last few readable lines of the screen, for a diagnostic. Freebuff
     /// can put a prompt here that the driver cannot answer; quoting it is
-    /// better than answering it blindly.
+    /// better than answering it blindly. A screen this grid could not fully
+    /// follow quotes nothing: a wrong frame is worse than an empty one.
     fn screen_tail(&self) -> String {
-        let mut lines: Vec<&str> = self
-            .screen
-            .lines()
-            .rev()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .take(12)
-            .collect();
-        lines.reverse();
-        let mut text = lines.join(" | ");
+        let Some(mut text) = self.screen.joined_tail(12) else {
+            return String::new();
+        };
         if text.chars().count() > SCREEN_TAIL {
             let start = text
                 .char_indices()
@@ -988,7 +992,9 @@ mod tests {
         session.turn_open = true;
         // No transcript progress at all: only the screen check can end this.
         session.last_progress = Instant::now();
-        session.screen = "Can't reach Freebuff's servers. Retrying…".to_string();
+        session
+            .screen
+            .feed("Can't reach Freebuff's servers. Retrying…".as_bytes());
 
         session.scan_screen();
 
@@ -1001,7 +1007,9 @@ mod tests {
         session.turn_open = true;
         session.last_progress = Instant::now();
         session.last_offline_check = Some(Instant::now());
-        session.screen = "Can't reach Freebuff's servers".to_string();
+        session
+            .screen
+            .feed("Can't reach Freebuff's servers".as_bytes());
 
         session.scan_screen();
 
@@ -1025,8 +1033,9 @@ mod tests {
         let mut session = Session::new();
         session.turn_open = true;
         session.last_progress = Instant::now();
-        session.screen =
-            "Starting your model session… Enter: confirm and send  Esc: back to draft".to_string();
+        session.screen.feed(
+            "Starting your model session… Enter: confirm and send  Esc: back to draft".as_bytes(),
+        );
 
         session.scan_screen();
 
@@ -1041,7 +1050,7 @@ mod tests {
     fn the_confirmation_is_bounded_and_paced() {
         let mut session = Session::new();
         session.turn_open = true;
-        session.screen = "Enter: confirm and send".to_string();
+        session.screen.feed("Enter: confirm and send".as_bytes());
 
         // Two presses inside the pacing gap are one press.
         session.scan_screen();
@@ -1065,12 +1074,15 @@ mod tests {
     fn a_dialog_already_dismissed_does_not_press_again() {
         let mut session = Session::new();
         session.turn_open = true;
-        // The dialog is in the scrollback, and the TUI has since drawn over it.
-        session.screen = String::from("Enter: confirm and send  Esc: back to draft\n");
+        // The dialog is at the top of the screen, and the TUI has since drawn
+        // twenty lines over it, so it is out of the tail a person reads.
+        session
+            .screen
+            .feed(b"Enter: confirm and send  Esc: back to draft\n");
         for i in 0..20 {
             session
                 .screen
-                .push_str(&format!("line {i} of the model talking\n"));
+                .feed(format!("line {i} of the model talking\n").as_bytes());
         }
 
         session.scan_screen();
@@ -1110,7 +1122,7 @@ mod tests {
         session.last_progress = Instant::now() - turn_limit() - Duration::from_secs(1);
         // A frozen screen, which is the case the short window is for.
         session.last_output = Instant::now() - Duration::from_secs(60);
-        session.screen = "some TUI text".to_string();
+        session.screen.feed("some TUI text".as_bytes());
 
         session.note_no_activity();
 
@@ -1125,7 +1137,7 @@ mod tests {
         session.last_progress = Instant::now() - turn_limit() - Duration::from_secs(1);
         // The TUI is still drawing, so the turn gets the longer window.
         session.last_output = Instant::now();
-        session.screen = "still working".to_string();
+        session.screen.feed("still working".as_bytes());
 
         session.note_no_activity();
 

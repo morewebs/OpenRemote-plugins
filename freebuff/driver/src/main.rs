@@ -15,6 +15,7 @@ mod logtail;
 mod probe;
 mod protocol;
 mod ptyproc;
+mod screen;
 mod session;
 mod transcript;
 
